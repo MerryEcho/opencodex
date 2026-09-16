@@ -16,6 +16,7 @@ import {
   responsesToolNameFromCursorWire,
 } from "./tool-definitions";
 import { drainCursorTextToolCalls } from "./text-toolcall";
+import { recordObservedCursorContextWindow } from "./discovery";
 import type { CursorServerMessage } from "./types";
 import type { TranslatorBudget } from "../../lib/translator-budget";
 
@@ -183,6 +184,8 @@ export interface CursorProtobufEventState {
   pendingTextToolCall?: string;
   /** Monotonic id suffix for tool calls promoted from text markers. */
   textToolCallSeq?: number;
+  /** Wire model id used to record checkpoint `maxTokens` for the next turn. */
+  wireModelId?: string;
 }
 
 
@@ -222,6 +225,8 @@ export function createCursorProtobufEventState(options: {
    */
   estimatedInputTokens?: number;
   translatorBudget?: TranslatorBudget;
+  /** Wire model id for recording checkpoint `maxTokens` into the process-local window map. */
+  wireModelId?: string;
 } = {}): CursorProtobufEventState {
   return {
     // Cursor provides no authoritative usage frame; token counts are heuristic estimates from
@@ -251,6 +256,7 @@ export function createCursorProtobufEventState(options: {
       && options.estimatedInputTokens > 0
       ? { estimatedInputTokens: options.estimatedInputTokens }
       : {}),
+    ...(options.wireModelId?.trim() ? { wireModelId: options.wireModelId.trim() } : {}),
   };
 }
 
@@ -1239,11 +1245,17 @@ export function mapCursorProtobufServerMessage(
   if (state.terminated) return [];
 
   if (serverMessage.message.case === "conversationCheckpointUpdate") {
-    const usedTokens = serverMessage.message.value.tokenDetails?.usedTokens ?? 0;
+    const tokenDetails = serverMessage.message.value.tokenDetails;
+    const usedTokens = tokenDetails?.usedTokens ?? 0;
     // `usedTokens` is the ABSOLUTE conversation context size, not a per-turn output delta. Track it
     // separately (monotonic max) and surface it as `done.usage.totalTokens`; folding it into
     // `outputTokens` (which also accumulates `tokenDelta`) double-counts in Codex. See contextTokens.
     observeContextTokens(state, usedTokens);
+    // First checkpoints often send maxTokens=0 (senpi). Only a positive ceiling
+    // replaces the id heuristic for the next turn's overflow vs 429 size prior.
+    if (state.wireModelId) {
+      recordObservedCursorContextWindow(state.wireModelId, tokenDetails?.maxTokens);
+    }
     return [];
   }
 
