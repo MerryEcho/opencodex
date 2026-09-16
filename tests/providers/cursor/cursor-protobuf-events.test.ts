@@ -1184,18 +1184,24 @@ describe("request-local input estimate (#373)", () => {
   });
 });
 
-describe("textual pseudo tool-call marker normalization (#2305)", () => {
+describe("textual pseudo tool-call marker quarantine", () => {
   function textDelta(text: string) {
     return interaction({ case: "textDelta", value: create(TextDeltaUpdateSchema, { text }) });
   }
 
-  test("display alias inside [TOOL_CALL]...[ARGS] markers folds to the wire name", () => {
-    const state = createCursorProtobufEventState();
+  test("display-alias marker is stripped from text and promoted as a real tool call", () => {
+    const state = createCursorProtobufEventState({ clientToolNames: ["grep"] });
     const events = mapCursorProtobufServerMessage(
-      textDelta('[TOOL_CALL]mcp_opencodex-responses_grep[ARGS]{"pattern":"OpenCodex"}'),
+      textDelta('before [TOOL_CALL]mcp_opencodex-responses_grep[ARGS]{"pattern":"OpenCodex"} after'),
       state,
     );
-    expect(events).toEqual([{ type: "text", text: '[TOOL_CALL]grep[ARGS]{"pattern":"OpenCodex"}' }]);
+    expect(events.filter(event => event.type === "text")).toEqual([
+      { type: "text", text: "before  after" },
+    ]);
+    expect(events.some(event => event.type === "tool_call_start" && event.name === "grep")).toBe(true);
+    expect(events.some(event => event.type === "tool_call_delta" && event.arguments === '{"pattern":"OpenCodex"}')).toBe(true);
+    expect(events.some(event => event.type === "tool_call_end")).toBe(true);
+    expect(JSON.stringify(events)).not.toContain("[TOOL_CALL]");
   });
 
   test("prose mentioning the display alias without markers stays untouched", () => {
@@ -1205,18 +1211,45 @@ describe("textual pseudo tool-call marker normalization (#2305)", () => {
     expect(events).toEqual([{ type: "text", text: prose }]);
   });
 
-  test("markers with a non-opencodex provider prefix are not rewritten", () => {
-    const state = createCursorProtobufEventState();
-    const other = "[TOOL_CALL]mcp_other-provider_grep[ARGS]{}";
-    const events = mapCursorProtobufServerMessage(textDelta(other), state);
-    expect(events).toEqual([{ type: "text", text: other }]);
+  test("unadvertised marker is stripped and not promoted", () => {
+    const state = createCursorProtobufEventState({ clientToolNames: ["grep"] });
+    const events = mapCursorProtobufServerMessage(
+      textDelta('[TOOL_CALL]mcp_other-provider_grep[ARGS]{"pattern":"x"}'),
+      state,
+    );
+    expect(events).toEqual([]);
+    expect(state.openToolCalls.size).toBe(0);
   });
 
-  test("already-short names inside markers pass through unchanged", () => {
-    const state = createCursorProtobufEventState();
-    const short = "[TOOL_CALL]grep[ARGS]{}";
-    const events = mapCursorProtobufServerMessage(textDelta(short), state);
-    expect(events).toEqual([{ type: "text", text: short }]);
+  test("short advertised name is stripped and promoted", () => {
+    const state = createCursorProtobufEventState({ clientToolNames: ["grep"] });
+    const events = mapCursorProtobufServerMessage(
+      textDelta("[TOOL_CALL]grep[ARGS]{}"),
+      state,
+    );
+    expect(events.filter(event => event.type === "text")).toEqual([]);
+    expect(events.some(event => event.type === "tool_call_start" && event.name === "grep")).toBe(true);
+  });
+
+  test("marker split across two text deltas is held then promoted", () => {
+    const state = createCursorProtobufEventState({ clientToolNames: ["grep"] });
+    const first = mapCursorProtobufServerMessage(textDelta("[TOOL_CALL]grep[ARGS]"), state);
+    expect(first).toEqual([]);
+    expect(state.pendingTextToolCall).toBe("[TOOL_CALL]grep[ARGS]");
+    const second = mapCursorProtobufServerMessage(textDelta('{"pattern":"x"}'), state);
+    expect(state.pendingTextToolCall).toBeUndefined();
+    expect(second.some(event => event.type === "tool_call_start" && event.name === "grep")).toBe(true);
+    expect(second.some(event => event.type === "tool_call_delta" && event.arguments === '{"pattern":"x"}')).toBe(true);
+    expect(JSON.stringify(second)).not.toContain("[TOOL_CALL]");
+  });
+
+  test("finalize drops an incomplete held marker instead of leaking it", () => {
+    const state = createCursorProtobufEventState({ clientToolNames: ["grep"] });
+    mapCursorProtobufServerMessage(textDelta("[TOOL_CALL]grep[ARGS]"), state);
+    const events = finalizeTurnEvents(state);
+    expect(state.pendingTextToolCall).toBeUndefined();
+    expect(JSON.stringify(events)).not.toContain("[TOOL_CALL]");
+    expect(events[0]?.type).toBe("done");
   });
 });
 

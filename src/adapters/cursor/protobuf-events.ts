@@ -11,11 +11,11 @@ import {
   isCodexShellBridgeToolName,
   isCursorStructuredEditToolName,
   normalizeCursorWireName,
-  normalizeCursorTextToolMarkers,
   OCX_RESPONSES_TOOL_PROVIDER,
   resolveShellBridgeAliasKey,
   responsesToolNameFromCursorWire,
 } from "./tool-definitions";
+import { drainCursorTextToolCalls } from "./text-toolcall";
 import type { CursorServerMessage } from "./types";
 import type { TranslatorBudget } from "../../lib/translator-budget";
 
@@ -176,6 +176,13 @@ export interface CursorProtobufEventState {
    */
   syntheticStructuredEditToolNames?: ReadonlySet<string>;
   translatorBudget?: TranslatorBudget;
+  /**
+   * Incomplete `[TOOL_CALL]…[ARGS]{` prefix held across `textDelta` frames so a
+   * marker split by the stream cannot leak into assistant text.
+   */
+  pendingTextToolCall?: string;
+  /** Monotonic id suffix for tool calls promoted from text markers. */
+  textToolCallSeq?: number;
 }
 
 
@@ -1243,11 +1250,31 @@ export function mapCursorProtobufServerMessage(
   if (serverMessage.message.case !== "interactionUpdate") return [];
   const update = serverMessage.message.value.message;
   switch (update.case) {
-    case "textDelta":
-      // #2305: fold Cursor display aliases inside textual pseudo tool-call markers back to
-      // the advertised wire name before any client sees the text. Real frames are already
-      // normalized structurally (mcpWireNameFromArgs above).
-      return update.value.text ? [{ type: "text", text: normalizeCursorTextToolMarkers(update.value.text) }] : [];
+    case "textDelta": {
+      // Textual `[TOOL_CALL]name[ARGS]{…}` is not assistant prose. Leaving it in
+      // the text channel (even after #2305 renamed the display alias) leaks a
+      // synthetic protocol marker that later turns few-shot-mimic as inert text.
+      // Strip complete markers, promote advertised names onto the tool-call
+      // path, and hold an incomplete opener across deltas.
+      const chunk = update.value.text ?? "";
+      if (!chunk && !state.pendingTextToolCall) return [];
+      const drained = drainCursorTextToolCalls(state.pendingTextToolCall ?? "", chunk);
+      if (drained.pending) state.pendingTextToolCall = drained.pending;
+      else delete state.pendingTextToolCall;
+      const out: CursorServerMessage[] = [];
+      if (drained.text) out.push({ type: "text", text: drained.text });
+      for (const call of drained.calls) {
+        const advertised = resolveAdvertisedClientToolName(state, call.name);
+        if (state.clientToolNames && !advertised) continue;
+        state.textToolCallSeq = (state.textToolCallSeq ?? 0) + 1;
+        const callId = `textcall_${state.textToolCallSeq}`;
+        out.push(...recordToolCall(state, callId, call.name));
+        if (state.openToolCalls.has(callId)) {
+          out.push(...commitToolCall(state, callId, normalizeJsonText(call.args, advertised ?? call.name, state)));
+        }
+      }
+      return out;
+    }
     case "thinkingDelta":
       return update.value.text ? [{ type: "thinking", thinking: update.value.text }] : [];
     case "toolCallStarted": {
@@ -1364,6 +1391,7 @@ export function resolvedTurnUsage(state: CursorProtobufEventState): OcxUsage {
  */
 export function finalizeTurnEvents(state: CursorProtobufEventState): CursorServerMessage[] {
   state.terminated = true;
+  delete state.pendingTextToolCall;
   if (state.openToolCalls.size > 0) {
     const openCallIds = [...state.openToolCalls.keys()];
     const openIds = openCallIds.join(", ");
