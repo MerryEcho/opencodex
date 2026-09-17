@@ -340,7 +340,10 @@ export function cursorConversationIdFromClientThread(threadId: string, identityS
 
 /**
  * Resolve the Cursor conversation id for this turn.
- * Priority: force-fresh → isolate helper → remembered → client thread owner → random.
+ * Priority: force-fresh → isolate helper → thread remint override → stored
+ * conversation id → client thread hash → random.
+ * The override must beat a stale `_cursorConversationId` so a second Responses
+ * chain in the same Codex thread does not keep ping-ponging the poisoned id.
  * Never use OpenAI Responses `previous_response_id` (resp_*) or shared `prompt_cache_key`
  * (cache-cohort fingerprint, not conversation ownership).
  */
@@ -351,11 +354,13 @@ export function resolveCursorConversationId(
 ): string {
   if (options.forceFreshConversation === true) return generatedCursorConversationId();
   if (parsed._cursorIsolateConversation === true) return generatedCursorConversationId();
-  if (parsed._cursorConversationId) return parsed._cursorConversationId;
   const threadId = cursorClientThreadOwner(parsed);
   if (threadId) {
     const recovered = lookupCursorThreadConversation(threadId, parsed._cursorIdentityScope);
     if (recovered) return recovered;
+  }
+  if (parsed._cursorConversationId) return parsed._cursorConversationId;
+  if (threadId) {
     return cursorConversationIdFromClientThread(`thread:${threadId}`, parsed._cursorIdentityScope);
   }
   return generatedCursorConversationId();

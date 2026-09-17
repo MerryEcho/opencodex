@@ -7,7 +7,12 @@ import {
   CursorMidstreamEchoObserver,
   CursorRoutingCommentarySniffer,
   MAX_MIDSTREAM_SCAN_LENGTH,
+  stripAssistantEchoedToolEnvelope,
 } from "../../../src/adapters/cursor/envelope-echo";
+import {
+  clearCursorThreadContinuityForTests,
+  lookupCursorThreadConversation,
+} from "../../../src/adapters/cursor/thread-continuity";
 import type { AdapterEvent, OcxParsedRequest, OcxProviderConfig } from "../../../src/types";
 import type { CursorRunRequest, CursorServerMessage } from "../../../src/adapters/cursor/types";
 import { withTestTranslatorBudget } from "../../helpers/translator-budget";
@@ -402,5 +407,72 @@ describe("cursor external output quarantine + corrective retry (devlog 260826 ga
     expect(text).not.toContain(fragments.join(""));
     expect(runRequests).toHaveLength(2);
     expect(runRequests[1]?.echoRetryContinuationText).toBe(CURSOR_ROUTING_COMMENTARY_RETRY_TEXT);
+  });
+});
+
+describe("stripAssistantEchoedToolEnvelope", () => {
+  test("keeps leading commentary and drops a whole-line envelope", () => {
+    const cleaned = stripAssistantEchoedToolEnvelope(
+      "20-24 pages are on the board.\n[Tool Result]\n[tool_result]\nname: Write\noutput:\nwrote it\n",
+    );
+    expect(cleaned).toBe("20-24 pages are on the board.");
+  });
+
+  test("does not strip an inline mention of the marker", () => {
+    const source = "The string [Tool Result] appeared in the transcript I reviewed.";
+    expect(stripAssistantEchoedToolEnvelope(source)).toBe(source);
+  });
+
+  test("drops a prefix-only envelope to empty text", () => {
+    expect(stripAssistantEchoedToolEnvelope("[Tool Result]\n[tool_result]\ncall_id: 1\n")).toBe("");
+  });
+});
+
+describe("Cursor midstream envelope-echo remint", () => {
+  test("remints after grok-4.6 copies [Tool Result] mid-message", async () => {
+    clearCursorThreadContinuityForTests();
+    const seen: string[] = [];
+    let attempts = 0;
+    const adapter = createCursorAdapter({ ...provider, apiKey: "cursor-token" }, {
+      createTransport: () => ({
+        async *run(request: CursorRunRequest) {
+          seen.push(request.conversationId);
+          attempts += 1;
+          if (attempts === 1) {
+            yield { type: "text", text: "I'll write the import script now.\n" } satisfies CursorServerMessage;
+            yield { type: "text", text: "[Tool Result]\n[tool_result]\nname: Write\n" } satisfies CursorServerMessage;
+            yield { type: "done", usage: { inputTokens: 1, outputTokens: 1 } } satisfies CursorServerMessage;
+            return;
+          }
+          yield { type: "text", text: "NEXT" } satisfies CursorServerMessage;
+          yield { type: "done", usage: { inputTokens: 1, outputTokens: 1 } } satisfies CursorServerMessage;
+        },
+        writeClient() {},
+      }),
+      rekeyContextUsage: () => {},
+    });
+
+    const threadId = "midstream-echo-remint-thread";
+    const body = {
+      ...toolResultBody("cursor/grok-4.6"),
+      _clientThreadId: threadId,
+      _cursorIdentityScope: "acct-midstream-echo",
+      _cursorConversationId: undefined,
+    } as OcxParsedRequest;
+
+    const first: AdapterEvent[] = [];
+    await adapter.runTurn?.(body, { headers: new Headers() }, event => first.push(event));
+    const firstText = first.filter(e => e.type === "text_delta").map(e => (e as { text: string }).text).join("");
+    expect(firstText).toContain("[Tool Result]");
+    expect(body._cursorConversationId).toBeDefined();
+    expect(body._cursorConversationId).not.toBe(seen[0]);
+    expect(lookupCursorThreadConversation(threadId, "acct-midstream-echo")).toBe(body._cursorConversationId);
+
+    const second: AdapterEvent[] = [];
+    await adapter.runTurn?.(body, { headers: new Headers() }, event => second.push(event));
+    expect(attempts).toBe(2);
+    expect(seen[1]).toBe(body._cursorConversationId);
+    expect(second.filter(e => e.type === "text_delta").map(e => (e as { text: string }).text).join("")).toBe("NEXT");
+    clearCursorThreadContinuityForTests();
   });
 });

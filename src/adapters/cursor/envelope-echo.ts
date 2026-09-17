@@ -13,6 +13,27 @@
  */
 
 const ECHO_MARKERS = ["[Tool Result]", "[Tool Error]", "[tool_result]"] as const;
+
+/**
+ * Drop a mid-message `[Tool Result]` / `[tool_result]` envelope from assistant
+ * history before Cursor root replay. The prefix sniffer retries echoes that
+ * start the turn; grok-4.6 often writes a real sentence first, so the echo
+ * already reached Codex and is persisted as assistant text. Replaying that
+ * block re-primes the next turn. Only whole-line markers count; inline mentions
+ * such as "the string [Tool Result] appeared" stay.
+ */
+export function stripAssistantEchoedToolEnvelope(text: string): string {
+  if (!text) return text;
+  const lines = text.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const probe = lines[i]!.replace(/^[ \t]*/, "");
+    if ((ECHO_MARKERS as readonly string[]).includes(probe)) {
+      return lines.slice(0, i).join("\n").trimEnd();
+    }
+  }
+  return text;
+}
+
 const MAX_SNIFF_BYTES = 40;
 /** Mid-stream observer: max leading whitespace on a line before matching disarms. */
 const MAX_MIDSTREAM_LINE_INDENT = 128;
@@ -59,15 +80,15 @@ export interface MidstreamEchoFinding {
 }
 
 /**
- * Diagnostic-only mid-stream envelope-echo observer (devlog 260828 F1/F2).
+ * Mid-stream envelope-echo observer (devlog 260828 F1/F2).
  *
  * The prefix sniffer only watches the first ~40 bytes of a turn, but live
  * probing caught grok-4.6 echoing "[Tool Result]" envelope blocks in the
  * MIDDLE of an agent message — after legitimate leading text — one of them
  * carrying a whitespace-spliced call-id ("fc_x mar-y" instead of "fc_x-y").
  * Deltas at that point have already reached the client, so this observer
- * never throws and never withholds output: it records findings so the
- * adapter can emit a structured diagnostic at turn end. Only fixed marker
+ * never throws and never withholds output. It records findings so the
+ * adapter can remint the conversation for the next turn. Only fixed marker
  * enums, numeric offsets, and corruption booleans are retained — never
  * content bytes.
  */

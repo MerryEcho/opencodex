@@ -191,6 +191,7 @@ export function createCursorAdapter(provider: OcxProviderConfig, deps: CursorAda
         let lastTransport: { captured?: Uint8Array } | undefined;
         let emittedClientTool = false;
         let sawIncompleteToolCall = false;
+        let sawMidstreamEnvelopeEcho = false;
         // Ordering proof for tool-suspended checkpoints: true only when the newest captured
         // checkpoint bytes arrived AFTER the turn emitted a client tool call, i.e. upstream
         // serialized its suspended-on-tool-call state. Only that snapshot can safely resume
@@ -272,8 +273,8 @@ export function createCursorAdapter(provider: OcxProviderConfig, deps: CursorAda
             isCursorExternalWireModel(activeRequest.modelId)
             && (_parsed.context.messages ?? []).some(message => message.role === "toolResult");
           const echoSniffer = armEchoSniffer ? new CursorEnvelopeEchoSniffer() : undefined;
-          // Mid-stream observer (devlog 260828 F1/F2): diagnostic-only; armed with the
-          // prefix sniffer because both fire on flattened tool-result replay priming.
+          // Mid-stream observer (devlog 260828 F1/F2): findings remint the next turn.
+          // Armed with the prefix sniffer because both fire on flattened tool-result replay priming.
           const midstreamObserver = armEchoSniffer ? new CursorMidstreamEchoObserver() : undefined;
           const armRoutingCommentarySniffer =
             isCursorExternalWireModel(activeRequest.modelId)
@@ -375,7 +376,9 @@ export function createCursorAdapter(provider: OcxProviderConfig, deps: CursorAda
                 }
                 if (event.type !== "heartbeat") emittedOutput = true;
                 if (event.type === "done") {
-                  for (const finding of midstreamObserver?.findings() ?? []) {
+                  const midstreamFindings = midstreamObserver?.findings() ?? [];
+                  if (midstreamFindings.length > 0) sawMidstreamEnvelopeEcho = true;
+                  for (const finding of midstreamFindings) {
                     debugProviderDiagnostic("cursor", "midstream-envelope-echo", {
                       wireModel: activeRequest.modelId,
                       conversationHash: activeRequest.conversationId.slice(0, 16),
@@ -520,9 +523,11 @@ export function createCursorAdapter(provider: OcxProviderConfig, deps: CursorAda
         }
         // Incomplete-tool errors are streamed, not thrown. Do not retry this turn; remint so
         // the next request does not reuse a Cursor conversation left waiting for mcpResult.
-        if (sawIncompleteToolCall && _parsed._cursorIsolateConversation !== true) {
+        // Mid-stream envelope echo has already reached Codex, so it cannot be quarantined;
+        // remint the next turn the same way, otherwise grok-4.6 keeps copying [Tool Result].
+        if ((sawIncompleteToolCall || sawMidstreamEnvelopeEcho) && _parsed._cursorIsolateConversation !== true) {
           if (inheritedCheckpointRef) invalidateCursorCheckpoint(inheritedCheckpointRef);
-          debugProviderDiagnostic("cursor", "incomplete-tool-remint", {
+          debugProviderDiagnostic("cursor", sawIncompleteToolCall ? "incomplete-tool-remint" : "midstream-envelope-echo-remint", {
             wireModel: request.modelId,
             conversationHash: request.conversationId.slice(0, 16),
           });

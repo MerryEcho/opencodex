@@ -1266,6 +1266,56 @@ describe("Cursor incomplete-tool conversation remint", () => {
     expect(secondEvents.some(event => event.type === "done")).toBe(true);
   });
 
+  test("a later Responses chain with the stale conversation id still uses the reminted override", async () => {
+    clearCursorThreadContinuityForTests();
+    const seen: string[] = [];
+    const adapter = createCursorAdapter({
+      ...provider,
+      apiKey: "cursor-token",
+    }, {
+      createTransport: () => ({
+        async *run(request) {
+          seen.push(request.conversationId);
+          if (seen.length === 1) {
+            yield { type: "error", message: INCOMPLETE_TOOL_ERROR } satisfies CursorServerMessage;
+            return;
+          }
+          yield { type: "done" } satisfies CursorServerMessage;
+        },
+        writeClient() {},
+      }),
+      rekeyContextUsage: () => {},
+    });
+
+    const threadId = "incomplete-tool-stale-chain";
+    const first: OcxParsedRequest = {
+      modelId: "cursor/grok-4.6",
+      context: { messages: [{ role: "user", content: "hello", timestamp: 1 }] },
+      stream: false,
+      options: {},
+      _cursorIdentityScope: "acct-incomplete-tool-stale",
+      _clientThreadId: threadId,
+    };
+    await adapter.runTurn?.(first, { headers: new Headers() }, () => {});
+    const reminted = first._cursorConversationId;
+    expect(reminted).toBeDefined();
+    expect(reminted).not.toBe(seen[0]);
+
+    const staleChain: OcxParsedRequest = {
+      modelId: "cursor/grok-4.6",
+      context: { messages: [{ role: "user", content: "hello", timestamp: 1 }] },
+      stream: false,
+      options: {},
+      _cursorIdentityScope: "acct-incomplete-tool-stale",
+      _clientThreadId: threadId,
+      _cursorConversationId: seen[0],
+    };
+    await adapter.runTurn?.(staleChain, { headers: new Headers() }, () => {});
+    expect(seen[1]).toBe(reminted);
+    expect(staleChain._cursorConversationId).toBe(reminted);
+    clearCursorThreadContinuityForTests();
+  });
+
   test("isolated helpers do not remint or park a throwaway id on the parent thread", async () => {
     clearCursorThreadContinuityForTests();
     clearCursorCheckpointsForTests();

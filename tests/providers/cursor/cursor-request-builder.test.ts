@@ -16,6 +16,10 @@ import {
   CURSOR_TOOL_BYTES_LIMIT,
   CURSOR_TOOL_COUNT_LIMIT,
 } from "../../../src/adapters/cursor/request-builder";
+import {
+  clearCursorThreadContinuityForTests,
+  rememberCursorThreadConversation,
+} from "../../../src/adapters/cursor/thread-continuity";
 import { cursorCheckpointModelAffinityId } from "../../../src/adapters/cursor/discovery";
 import { cursorMcpToolsEncodedSize } from "../../../src/adapters/cursor/tool-definitions";
 import { encodeCursorCallId, resetCursorCallIdProvenanceForTests } from "../../../src/adapters/cursor/call-id";
@@ -77,6 +81,42 @@ describe("Cursor request builder", () => {
     });
 
     expect(continuation.conversationId).toBe(initial.conversationId);
+  });
+
+  test("thread remint override wins over a stale stored Cursor conversation id", () => {
+    clearCursorThreadContinuityForTests();
+    rememberCursorThreadConversation("thread-poisoned", "cursor_fresh", "acct-sticky");
+    try {
+      const request = createCursorRequest({
+        ...base,
+        modelId: "cursor/grok-4.6",
+        _clientThreadId: "thread-poisoned",
+        _cursorConversationId: "cursor_stale",
+        _cursorIdentityScope: "acct-sticky",
+      });
+      expect(request.conversationId).toBe("cursor_fresh");
+    } finally {
+      clearCursorThreadContinuityForTests();
+    }
+  });
+
+  test("isolated helpers ignore the parent thread remint override", () => {
+    clearCursorThreadContinuityForTests();
+    rememberCursorThreadConversation("thread-poisoned", "cursor_fresh", "acct-sticky");
+    try {
+      const request = createCursorRequest({
+        ...base,
+        modelId: "cursor/grok-4.6",
+        _clientThreadId: "thread-poisoned",
+        _cursorConversationId: "cursor_parent",
+        _cursorIdentityScope: "acct-sticky",
+        _cursorIsolateConversation: true,
+      });
+      expect(request.conversationId).not.toBe("cursor_fresh");
+      expect(request.conversationId).not.toBe("cursor_parent");
+    } finally {
+      clearCursorThreadContinuityForTests();
+    }
   });
 
   test("uses a Cursor-only Desktop owner without widening Responses replay scope", () => {

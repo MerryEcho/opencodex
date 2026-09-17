@@ -670,9 +670,54 @@ describe("Cursor blob handshake", () => {
     const roots = JSON.stringify(decodeRootMessages(bytes));
     expect(roots).toContain("available tool names are exactly `mcp__fs__read_file`");
     expect(roots).not.toContain("`mcp__fs__write_file`");
-    expect(roots).toContain("neighboring-agent tool names `Read`, `Grep`, `Glob`, `Bash`, `LS`");
+    expect(roots).toContain("neighboring-agent tool names `Read`, `Grep`, `Glob`, `Bash`, `LS`, `Write`");
     expect(roots).toContain("unless a tool result was actually returned");
 
+  });
+
+  test("strips grok-4.6 assistant-echoed [Tool Result] blocks from root replay", () => {
+    const bytes = encodeCursorRunRequest({
+      modelId: "grok-4.6",
+      conversationId: "c-echo-sanitize",
+      system: ["You are helpful."],
+      messages: [{ role: "user", content: "continue" }],
+      rawMessages: [
+        { role: "user", content: "import the images", timestamp: 1 },
+        {
+          role: "assistant",
+          model: "cursor/grok-4.6",
+          content: [{
+            type: "text",
+            text: [
+              "20-24 pages are on the board.",
+              "[Tool Result]",
+              "[tool_result]",
+              "call_id: 1",
+              "name: Write",
+              "output:",
+              "wrote import_images.py",
+            ].join("\n"),
+          }],
+          timestamp: 2,
+        },
+        {
+          role: "toolResult",
+          toolCallId: "call_real",
+          toolName: "exec",
+          content: "ok",
+          isError: false,
+          timestamp: 3,
+        },
+        { role: "user", content: "continue", timestamp: 4 },
+      ],
+    });
+
+    const roots = JSON.stringify(decodeRootMessages(bytes));
+    expect(roots).toContain("20-24 pages are on the board.");
+    expect(roots).not.toContain("name: Write");
+    expect(roots).not.toContain("wrote import_images.py");
+    expect(roots).toContain("[Tool Result]");
+    expect(roots).toContain("ok");
   });
 
   test("keeps exec_command guidance in the system prompt without mutating the user request", () => {
