@@ -1207,3 +1207,116 @@ describe("Cursor overflow accounting across requests", () => {
     }
   });
 });
+
+const INCOMPLETE_TOOL_ERROR =
+  "Cursor stream ended with incomplete tool call(s): call_abc. Arguments may be truncated; the call was not committed.";
+
+describe("Cursor incomplete-tool conversation remint", () => {
+  test("remints after a streamed incomplete-tool error and persists the thread override", async () => {
+    clearCursorThreadContinuityForTests();
+    let attempts = 0;
+    const seen: string[] = [];
+    const adapter = createCursorAdapter({
+      ...provider,
+      apiKey: "cursor-token",
+    }, {
+      createTransport: () => ({
+        async *run(request) {
+          attempts += 1;
+          seen.push(request.conversationId);
+          if (attempts === 1) {
+            yield { type: "error", message: INCOMPLETE_TOOL_ERROR } satisfies CursorServerMessage;
+            return;
+          }
+          yield { type: "done" } satisfies CursorServerMessage;
+        },
+        writeClient() {},
+      }),
+      rekeyContextUsage: () => {},
+    });
+
+    const threadId = "incomplete-tool-remint-thread";
+    const body: OcxParsedRequest = {
+      modelId: "cursor/grok-4.6",
+      context: { messages: [{ role: "user", content: "hello", timestamp: 1 }] },
+      stream: false,
+      options: {},
+      _cursorIdentityScope: "acct-incomplete-tool-remint",
+      _clientThreadId: threadId,
+    };
+
+    const firstEvents: AdapterEvent[] = [];
+    await adapter.runTurn?.(body, { headers: new Headers() }, event => firstEvents.push(event));
+
+    expect(attempts).toBe(1);
+    expect(firstEvents).toEqual([
+      { type: "error", message: INCOMPLETE_TOOL_ERROR },
+    ]);
+    expect(body._cursorConversationId).toBeDefined();
+    expect(body._cursorConversationId).not.toBe(seen[0]);
+    expect(lookupCursorThreadConversation(threadId, "acct-incomplete-tool-remint")).toBe(body._cursorConversationId);
+
+    const secondEvents: AdapterEvent[] = [];
+    await adapter.runTurn?.(body, { headers: new Headers() }, event => secondEvents.push(event));
+
+    expect(attempts).toBe(2);
+    expect(seen).toHaveLength(2);
+    expect(seen[1]).toBe(body._cursorConversationId);
+    expect(seen[1]).not.toBe(seen[0]);
+    expect(secondEvents.some(event => event.type === "done")).toBe(true);
+  });
+
+  test("isolated helpers do not remint or park a throwaway id on the parent thread", async () => {
+    clearCursorThreadContinuityForTests();
+    clearCursorCheckpointsForTests();
+    const seen: string[] = [];
+    const adapter = createCursorAdapter({ ...provider, apiKey: "cursor-token" }, {
+      createTransport: () => ({
+        async *run(request) {
+          seen.push(request.conversationId);
+          yield { type: "error", message: INCOMPLETE_TOOL_ERROR } satisfies CursorServerMessage;
+        },
+        writeClient() {},
+      }),
+    });
+
+    try {
+      const owner = "incomplete-tool-isolated-helper";
+      const parentRef = commitCursorCheckpoint({
+        conversationId: "cursor_parent_incomplete",
+        identityScope: "acct-incomplete-tool-remint",
+        modelId: "default",
+        checkpointBytes: toBinary(ConversationStateStructureSchema, create(ConversationStateStructureSchema, {
+          pendingToolCalls: ["incomplete-isolation-fixture"],
+        })),
+        coveredMessageCount: 1,
+      });
+      expect(parentRef).toBeDefined();
+
+      const helper: OcxParsedRequest = {
+        modelId: "cursor/grok-4.6",
+        context: { messages: [{ role: "user", content: "hello", timestamp: 1 }] },
+        stream: false,
+        options: {},
+        _cursorIsolateConversation: true,
+        _cursorConversationId: "cursor_parent_incomplete",
+        _cursorIdentityScope: "acct-incomplete-tool-remint",
+        _clientThreadId: owner,
+        _providerContinuation: {
+          cursor: { conversationId: "cursor_parent_incomplete", checkpointUsable: true, checkpointRef: parentRef },
+        },
+      };
+      const events: AdapterEvent[] = [];
+      await adapter.runTurn?.(helper, { headers: new Headers() }, event => events.push(event));
+
+      expect(seen).toHaveLength(1);
+      expect(events).toEqual([{ type: "error", message: INCOMPLETE_TOOL_ERROR }]);
+      expect(helper._cursorConversationId).toBe(seen[0]);
+      expect(getCursorCheckpoint(parentRef)?.ref).toBe(parentRef);
+      expect(lookupCursorThreadConversation(owner, "acct-incomplete-tool-remint")).toBeUndefined();
+    } finally {
+      clearCursorThreadContinuityForTests();
+      clearCursorCheckpointsForTests();
+    }
+  });
+});

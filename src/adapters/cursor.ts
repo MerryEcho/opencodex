@@ -3,7 +3,7 @@ import type { AdapterEvent, OcxProviderConfig } from "../types";
 import type { ProviderAdapter } from "./base";
 import { isTranslatorBudgetExceededError } from "../lib/translator-budget";
 import { cursorExecDeniedMessage, cursorRequestDeclaresFullAccess } from "./cursor/exec-policy";
-import { isCursorBenignCancelError, isCursorInvalidArgumentError, isCursorOverflowRemintCandidate, isCursorRootEnvelopeError, safeCursorErrorMessage, type CursorSizeContext } from "./cursor/cursor-errors";
+import { isCursorBenignCancelError, isCursorIncompleteToolCallMessage, isCursorInvalidArgumentError, isCursorOverflowRemintCandidate, isCursorRootEnvelopeError, safeCursorErrorMessage, type CursorSizeContext } from "./cursor/cursor-errors";
 import { cursorCheckpointModelAffinityId, inferCursorContextWindow, isCursorExternalWireModel } from "./cursor/discovery";
 import { createCursorKvStore, type CursorKvStore } from "./cursor/kv-store";
 import { mapCursorServerMessage } from "./cursor/message-mapper";
@@ -190,6 +190,7 @@ export function createCursorAdapter(provider: OcxProviderConfig, deps: CursorAda
         let completedNormally = false;
         let lastTransport: { captured?: Uint8Array } | undefined;
         let emittedClientTool = false;
+        let sawIncompleteToolCall = false;
         // Ordering proof for tool-suspended checkpoints: true only when the newest captured
         // checkpoint bytes arrived AFTER the turn emitted a client tool call, i.e. upstream
         // serialized its suspended-on-tool-call state. Only that snapshot can safely resume
@@ -332,6 +333,9 @@ export function createCursorAdapter(provider: OcxProviderConfig, deps: CursorAda
                },
              });
              for (const event of events) {
+                if (event.type === "error" && isCursorIncompleteToolCallMessage(event.message)) {
+                  sawIncompleteToolCall = true;
+                }
                 if (!guardsSettled()) {
                   if (event.type === "text_delta") {
                     guardHeld.push(event);
@@ -513,6 +517,16 @@ export function createCursorAdapter(provider: OcxProviderConfig, deps: CursorAda
               break;
             }
           }
+        }
+        // Incomplete-tool errors are streamed, not thrown. Do not retry this turn; remint so
+        // the next request does not reuse a Cursor conversation left waiting for mcpResult.
+        if (sawIncompleteToolCall && _parsed._cursorIsolateConversation !== true) {
+          if (inheritedCheckpointRef) invalidateCursorCheckpoint(inheritedCheckpointRef);
+          debugProviderDiagnostic("cursor", "incomplete-tool-remint", {
+            wireModel: request.modelId,
+            conversationHash: request.conversationId.slice(0, 16),
+          });
+          remintConversationId(request.conversationId);
         }
         if (
           request.checkpointInvalidationReason

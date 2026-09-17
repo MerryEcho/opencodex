@@ -37,6 +37,7 @@ import {
   CURSOR_EXTERNAL_TOOL_CONTINUATION_TEXT,
   CURSOR_EXTERNAL_ROOT_BLOB_LIMIT,
   CURSOR_ROUTING_LEVEL_PARAMETER_ID,
+  CURSOR_MISSING_TOOL_RESULT,
   encodeCursorRunRequest,
   prepareCursorRunRequest,
 } from "../../../src/adapters/cursor/protobuf-request";
@@ -838,6 +839,49 @@ describe("Cursor blob handshake", () => {
     expect(run?.action?.action.case).toBe("userMessageAction");
     const value = run?.action?.action.case === "userMessageAction" ? run.action.action.value : undefined;
     expect(value?.userMessage?.text).toBe(CURSOR_EXTERNAL_TOOL_CONTINUATION_TEXT);
+  });
+
+  test("native Composer unpaired tool calls replay with a missing-result placeholder", () => {
+    resetCursorCallIdProvenanceForTests();
+    const local = encodeCursorCallId("ocxc1e_");
+    const bytes = encodeCursorRunRequest({
+      modelId: "composer-2.5",
+      conversationId: "c1",
+      system: ["You are helpful."],
+      messages: [{ role: "user", content: "continue anyway" }],
+      rawMessages: [
+        { role: "user", content: "read a file", timestamp: 1 },
+        {
+          role: "assistant",
+          model: "cursor/auto",
+          timestamp: 2,
+          content: [{ type: "toolCall", id: local, name: "read_file", arguments: { path: "a.txt" } }],
+        },
+        { role: "user", content: "continue anyway", timestamp: 3 },
+      ],
+    });
+    const msg = fromBinary(AgentClientMessageSchema, bytes);
+    const run = msg.message.case === "runRequest" ? msg.message.value : undefined;
+    const turnIds = run?.conversationState?.turns ?? [];
+    expect(turnIds).toHaveLength(1);
+    const turn = fromBinary(ConversationTurnStructureSchema, blobData(turnIds[0]!));
+    expect(turn.turn.case).toBe("agentConversationTurn");
+    const steps = turn.turn.value.steps;
+    expect(steps).toHaveLength(1);
+    const step = fromBinary(ConversationStepSchema, blobData(steps[0]!));
+    expect(step.message.case).toBe("toolCall");
+    const tool = step.message.value.tool;
+    expect(tool.case).toBe("mcpToolCall");
+    if (tool.case === "mcpToolCall") {
+      expect(tool.value.args?.toolCallId).toBe("ocxc1e_");
+      expect(tool.value.result?.result.case).toBe("success");
+      if (tool.value.result?.result.case === "success") {
+        expect(tool.value.result.result.value.isError).toBe(true);
+        const content = tool.value.result.result.value.content[0]?.content;
+        expect(content?.case).toBe("text");
+        if (content?.case === "text") expect(content.value.text).toBe(CURSOR_MISSING_TOOL_RESULT);
+      }
+    }
   });
 
   test("native protobuf replay leaves an opaque escape lookalike byte-identical", () => {
