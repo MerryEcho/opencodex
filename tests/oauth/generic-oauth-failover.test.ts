@@ -11,8 +11,10 @@ import {
   isGenericFailoverProvider,
   isGenericOAuthFailoverEnabled,
   noteGenericPoolSelection,
+  isGenericOAuthFailoverStatus,
   preferredInitialAccount,
   rotateGenericOAuthAccountOn429,
+  rotateGenericOAuthAccountOnError,
 } from "../../src/oauth/generic-account-failover";
 import { getAccountSet, markAccountNeedsReauth, saveCredential, setActiveAccount } from "../../src/oauth/store";
 import { clearAccountQuotaCache, setCachedProviderAccountQuotaForTests } from "../../src/providers/quota";
@@ -385,7 +387,7 @@ describe("sidecar on429 wiring", () => {
     const rotators = {
       key: /hasKeyPoolFailover\(/g,
       anthropic: /rotateAnthropicAccountOn429\(/g,
-      generic: /rotateGenericOAuthAccountOn429\(/g,
+      generic: /rotateGenericOAuthAccountOn(?:429|Error)\(/g,
     };
     const counts = Object.fromEntries(
       Object.entries(rotators).map(([name, re]) => [name, (coreSource.match(re) ?? []).length]),
@@ -669,5 +671,51 @@ describe("#695 the generic pool consumes its persisted strategy behind pool.kern
 
     const next = rotateGenericOAuthAccountOn429(cfg, "xai", sorted[0]!, null);
     expect(next).toBe(sorted[1]!);
+  });
+});
+
+describe("403 and 401 failover and proactive steering", () => {
+  test("isGenericOAuthFailoverStatus matches 429, 403, and 401", () => {
+    expect(isGenericOAuthFailoverStatus(429)).toBe(true);
+    expect(isGenericOAuthFailoverStatus(403)).toBe(true);
+    expect(isGenericOAuthFailoverStatus(401)).toBe(true);
+    expect(isGenericOAuthFailoverStatus(200)).toBe(false);
+    expect(isGenericOAuthFailoverStatus(400)).toBe(false);
+    expect(isGenericOAuthFailoverStatus(500)).toBe(false);
+    expect(isGenericOAuthFailoverStatus(502)).toBe(false);
+  });
+
+  test("rotateGenericOAuthAccountOnError rotates on 403/401 with max cooldown", async () => {
+    const gaConfig: OcxConfig = {
+      oauthAccountFailover: { enabled: true },
+      providers: {
+        "google-antigravity": {
+          adapter: "google-gemini",
+          baseUrl: "https://generativelanguage.googleapis.com",
+          authMode: "oauth",
+          oauthAccountFailover: { enabled: true },
+        } as unknown as OcxProviderConfig,
+      },
+    } as unknown as OcxConfig;
+
+    for (let i = 0; i < 2; i++) {
+      await saveCredential("google-antigravity", {
+        access: "access-" + i,
+        refresh: "refresh-" + i,
+        expires: Date.now() + 3_600_000,
+        accountId: "ga-acc-" + i,
+      } as never, { addAccount: true });
+    }
+    const ids = getAccountSet("google-antigravity")?.accounts.map(a => a.id) ?? [];
+    expect(ids.length).toBe(2);
+    await setActiveAccount("google-antigravity", ids[0]!);
+
+    const now = Date.now();
+    const rotated = rotateGenericOAuthAccountOnError(gaConfig, "google-antigravity", ids[0]!, 403, null, now);
+    expect(rotated).toBe(ids[1]!);
+
+    // Should proactively steer to ids[1] on next pre-dispatch because active account is cooled
+    const steered = preferredInitialAccount(gaConfig, "google-antigravity", now + 1000);
+    expect(steered).toBe(ids[1]!);
   });
 });

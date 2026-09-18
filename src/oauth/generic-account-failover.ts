@@ -314,6 +314,7 @@ export function rotateGenericOAuthAccountOn429(
   retryAfterHeader: string | null | undefined,
   now = Date.now(),
   requestedModelId?: string | null,
+  cooldownOverrideMs?: number,
 ): string | null {
   if (!isGenericOAuthFailoverEnabled(config, providerName)) return null;
   const set = getAccountSet(providerName);
@@ -325,7 +326,7 @@ export function rotateGenericOAuthAccountOn429(
   // the default minute: retrying it every 60s until the window rolls over is pure waste.
   // A Retry-After from upstream still wins — it is the server's own instruction.
   const exhausted = parsed === undefined ? exhaustedCooldownMs(providerName, failedAccountId, now) : null;
-  const cooldownMs = exhausted ?? Math.min(parsed ?? DEFAULT_COOLDOWN_MS, MAX_COOLDOWN_MS);
+  const cooldownMs = cooldownOverrideMs ?? exhausted ?? Math.min(parsed ?? DEFAULT_COOLDOWN_MS, MAX_COOLDOWN_MS);
   const family = classifyModelFamilyForQuota(providerName, requestedModelId);
   health.set(healthKey(providerName, failedAccountId, family), {
     cooldownUntil: now + cooldownMs,
@@ -373,6 +374,37 @@ export function rotateGenericOAuthAccountOn429(
   // With no quota evidence this returns the ring untouched, so providers without
   // per-account quota keep exactly the traversal they have today.
   return rankAccountsByHeadroom(providerName, candidates, requestedModelId)[0] ?? null;
+}
+
+/**
+ * Statuses that warrant rotating to the next account in the pool.
+ * - 429: Rate limit / Quota exhausted
+ * - 403: Forbidden / Permission Denied / Verification required (e.g. Google Cloud Code Assist VALIDATION_REQUIRED)
+ * - 401: Unauthorized / Expired / Revoked token
+ */
+export function isGenericOAuthFailoverStatus(status: number, providerName?: string): boolean {
+  if (status === 429) return true;
+  if (status === 403 || status === 401) return true;
+  return false;
+}
+
+/**
+ * Rotate account on 429 or auth/permission errors (403/401).
+ * For 403/401, sets a 15-minute cooldown so that unverified or unauthorized accounts
+ * are not immediately hammered again by subsequent requests.
+ */
+export function rotateGenericOAuthAccountOnError(
+  config: OcxConfig,
+  providerName: string,
+  failedAccountId: string,
+  status: number,
+  retryAfterHeader?: string | null,
+  now = Date.now(),
+  requestedModelId?: string | null,
+): string | null {
+  const isAuthOrPermError = status === 403 || status === 401;
+  const cooldownOverrideMs = isAuthOrPermError ? MAX_COOLDOWN_MS : undefined;
+  return rotateGenericOAuthAccountOn429(config, providerName, failedAccountId, retryAfterHeader, now, requestedModelId, cooldownOverrideMs);
 }
 
 /**
@@ -443,19 +475,13 @@ export function preferredInitialAccount(
   }
 
   const activeRow = selected.accounts.find(account => account.id === active);
-  if (activeRow && activeRow.needsReauth !== true
+  const activeHealthy = activeRow && activeRow.needsReauth !== true
     && !isCooled(providerName, activeRow.id, now, classifyModelFamilyForQuota(providerName, requestedModelId))
-    && !isAccountQuotaExhausted(providerName, activeRow.id, requestedModelId)) return null;
-
-  // Evidence is required BEFORE eligibility narrows the field. Without this, a provider
-  // with no quota data at all could still be redirected: cool the active account with a
-  // 429 and the eligible list collapses to one candidate, which any ranking returns
-  // unchanged — an answer that looks ranked but was never measured. The no-op guarantee
-  // for quota-less providers has to be checked on the full roster.
-  if (!hasHeadroomEvidence(providerName, order, requestedModelId)) return null;
+    && !isAccountQuotaExhausted(providerName, activeRow.id, requestedModelId);
+  if (activeHealthy) return null;
 
   // Cooldowns are respected here, unlike in the presence count: this picks the account to
-  // send to right now, and one inside its 429 window is the single candidate we hold
+  // send to right now, and one inside its cooldown window is the single candidate we hold
   // positive evidence against.
   const eligible = order.filter(id => !isCooled(providerName, id, now, classifyModelFamilyForQuota(providerName, requestedModelId)));
   if (eligible.length === 0) return null;
@@ -466,12 +492,16 @@ export function preferredInitialAccount(
   const candidates = ring.filter(id => eligible.includes(id));
   if (candidates.length === 0) return null;
 
-  const best = rankAccountsByHeadroom(providerName, candidates, requestedModelId)[0] ?? null;
-  // Nothing to do when the ranking agrees with the account we would have used anyway.
-  //
-  // A proposal still needs guarded selection commit after credential resolution: a
-  // removal, reauth verdict, or manual choice can arrive during that await.
-  return best && best !== active ? best : null;
+  if (hasHeadroomEvidence(providerName, order, requestedModelId)) {
+    const best = rankAccountsByHeadroom(providerName, candidates, requestedModelId)[0] ?? null;
+    return best && best !== active ? best : null;
+  }
+
+  // Active account is unhealthy (cooled or needs reauth) and provider has no quota telemetry:
+  // proactively steer to the next uncooled eligible candidate in the ring so we avoid hammering
+  // an account known to be in cooldown or failing auth.
+  const nextCandidate = candidates.find(id => id !== active) ?? candidates[0] ?? null;
+  return nextCandidate && nextCandidate !== active ? nextCandidate : null;
 }
 
 /** Earliest remaining cooldown, for a client-facing Retry-After when every account is cooled. */

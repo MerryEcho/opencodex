@@ -41,6 +41,8 @@ import {
 import {
   GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST,
   isGenericOAuthFailoverEnabled,
+  isGenericOAuthFailoverStatus,
+  rotateGenericOAuthAccountOnError,
   rotateGenericOAuthAccountOn429,
   failoverAccountSnapshot,
 } from "../../oauth/generic-account-failover";
@@ -401,11 +403,11 @@ export function createAdapterContinuations(
       // 429 stayed terminal even with failover fully active -- the same class of divergence the
       // two sidecars already produced once. Request-local state is shared with the other arms so
       // the per-request bound cannot be silently re-armed by reaching a different loop.
-     if (
-       response.status === 429
-       && transportState.genericFailoverAccountId
+      if (
+        isGenericOAuthFailoverStatus(response.status, route.providerName)
+        && transportState.genericFailoverAccountId
         && !isNonReplayableResponse(response)
-       && transportState.genericFailovers < GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST
+        && transportState.genericFailovers < GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST
         && isGenericOAuthFailoverEnabled(config, route.providerName)
       ) {
         // Intersection with the shared request budget. The continuation loop re-sends the
@@ -418,14 +420,15 @@ export function createAdapterContinuations(
         const adapterOwnsDispatch = transportState.activeAdapter.fetchResponse !== undefined;
         const hop = reserveCredentialHop(
           "auth-recovery",
-          `${route.providerName}|${route.modelId}|continuation-oauth-429`,
+          `${route.providerName}|${route.modelId}|continuation-oauth-failover`,
           !adapterOwnsDispatch && transientRetryPolicyFor(route.provider) !== null,
         );
         const nextAccountId = hop.allowed
-          ? rotateGenericOAuthAccountOn429(
+          ? rotateGenericOAuthAccountOnError(
             config,
             route.providerName,
             transportState.genericFailoverAccountId,
+            response.status,
             response.headers.get("retry-after"),
             Date.now(),
             route.modelId,
