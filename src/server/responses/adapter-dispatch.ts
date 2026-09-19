@@ -53,6 +53,7 @@ import {
 } from "../../oauth/anthropic-routing";
 import {
   GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST,
+  genericOAuthMaxFailovers,
   isGenericOAuthFailoverEnabled,
   isGenericOAuthFailoverStatus,
   rotateGenericOAuthAccountOnError,
@@ -783,7 +784,7 @@ export async function prepareAdapterExchange(
       while (
         isGenericOAuthFailoverStatus(upstreamResponse.status, route.providerName)
         && transportState.genericFailoverAccountId
-        && transportState.genericFailovers < GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST
+        && transportState.genericFailovers < genericOAuthMaxFailovers(route.providerName)
         && isGenericOAuthFailoverEnabled(config, route.providerName)
       ) {
         // Intersection with the shared request budget. This arm re-sends through
@@ -809,6 +810,15 @@ export async function prepareAdapterExchange(
           !adapterOwnsDispatch && transientRetryPolicyFor(route.provider) !== null,
         );
         if (!hop.allowed) break;
+        let errorDetails: string | undefined;
+        if (upstreamResponse.status === 403 || upstreamResponse.status === 401) {
+          try {
+            const cloned = upstreamResponse.clone();
+            errorDetails = await cloned.text().catch(() => undefined);
+          } catch {
+            // ignore
+          }
+        }
         const nextAccountId = rotateGenericOAuthAccountOnError(
           config,
           route.providerName,
@@ -817,6 +827,7 @@ export async function prepareAdapterExchange(
           upstreamResponse.headers.get("retry-after"),
           Date.now(),
           route.modelId,
+          errorDetails,
         );
         if (!nextAccountId) {
           hop.permit?.release();

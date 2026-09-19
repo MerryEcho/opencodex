@@ -40,6 +40,7 @@ import {
 } from "../../oauth/anthropic-routing";
 import {
   GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST,
+  genericOAuthMaxFailovers,
   isGenericOAuthFailoverEnabled,
   isGenericOAuthFailoverStatus,
   rotateGenericOAuthAccountOnError,
@@ -407,7 +408,7 @@ export function createAdapterContinuations(
         isGenericOAuthFailoverStatus(response.status, route.providerName)
         && transportState.genericFailoverAccountId
         && !isNonReplayableResponse(response)
-        && transportState.genericFailovers < GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST
+        && transportState.genericFailovers < genericOAuthMaxFailovers(route.providerName)
         && isGenericOAuthFailoverEnabled(config, route.providerName)
       ) {
         // Intersection with the shared request budget. The continuation loop re-sends the
@@ -423,6 +424,15 @@ export function createAdapterContinuations(
           `${route.providerName}|${route.modelId}|continuation-oauth-failover`,
           !adapterOwnsDispatch && transientRetryPolicyFor(route.provider) !== null,
         );
+        let errorDetails: string | undefined;
+        if (response.status === 403 || response.status === 401) {
+          try {
+            const cloned = response.clone();
+            errorDetails = await cloned.text().catch(() => undefined);
+          } catch {
+            // ignore
+          }
+        }
         const nextAccountId = hop.allowed
           ? rotateGenericOAuthAccountOnError(
             config,
@@ -432,6 +442,7 @@ export function createAdapterContinuations(
             response.headers.get("retry-after"),
             Date.now(),
             route.modelId,
+            errorDetails,
           )
           : null;
         // Eligible and refused by the shared budget, as opposed to eligible and finding no next
