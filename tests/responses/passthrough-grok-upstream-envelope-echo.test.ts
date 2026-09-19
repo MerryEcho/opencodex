@@ -89,4 +89,3 @@ describe("xAI upstream grok-4.6 envelope-echo rewrite", () => {
     expect(stripped).not.toContain("[Tool Result]");
   });
 });
-

@@ -441,6 +441,18 @@ describe("stripAssistantEchoedToolEnvelope", () => {
   test("drops a prefix-only envelope to empty text", () => {
     expect(stripAssistantEchoedToolEnvelope("[Tool Result]\n[tool_result]\ncall_id: 1\n")).toBe("");
   });
+
+  test("drops a trailing [Tool call: echo after commentary", () => {
+    expect(stripAssistantEchoedToolEnvelope(
+      "I will locate the existing registration scripts and back up the tasks.\n[Tool call: Glob",
+    )).toBe("I will locate the existing registration scripts and back up the tasks.");
+  });
+
+  test("drops a truncated [Tool Result line without a closing bracket", () => {
+    expect(stripAssistantEchoedToolEnvelope(
+      "The previous read exceeded the parameter limit.\n[Tool Result",
+    )).toBe("The previous read exceeded the parameter limit.");
+  });
 });
 
 describe("Cursor midstream envelope-echo remint", () => {

@@ -88,4 +88,3 @@ export function createGrokUpstreamEnvelopeEchoBlockRewrite(): SseBlockRewrite {
   };
   return rewrite;
 }
-
