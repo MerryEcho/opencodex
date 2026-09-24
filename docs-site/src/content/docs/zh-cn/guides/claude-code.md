@@ -91,6 +91,53 @@ Anthropic。若任一提供方请求头包含代理准入密钥，该密钥会�
 可以设置 `claudeCode.nativePassthrough: false` 来禁用；也可以通过
 `claudeCode.anthropicBaseUrl` 指向其他位置。
 
+## Claude Desktop 模式：网关（默认）与第一方
+
+在控制台的 **Claude → Desktop → 连接模式** 中，或使用
+`ocx claude desktop apply --first-party|--gateway` 选择互斥的模式。
+
+### 网关（默认）
+
+新安装默认应用网关配置档案：包括聊天标签页在内的整个应用都通过 OpenCodex。
+仅限 claude.ai 的功能此时不可用。旧版 `--static`、`--hybrid` 和 `--discovery-only`
+选项也会选择网关。
+
+### 第一方（主动选择）
+
+:::caution[账户风险]
+第一方模式会让你的 Claude 订阅流量经过本地拦截代理。
+Anthropic 可能认为这违反其条款并暂停你的账户。默认模式是网关；
+只有接受这一风险时才选择第一方模式。
+:::
+
+Desktop 保持登录 claude.ai，聊天、连接器和远程控制仍可使用。OpenCodex 只在
+`~/.claude/settings.json`（支持 `CLAUDE_CONFIG_DIR`）的 `env` 中写入 `HTTPS_PROXY`
+和 `NODE_EXTRA_CA_CERTS`。Code 标签页启动的 Claude Code、子代理及独立的 `claude` CLI
+经过本地代理；其他 `api.anthropic.com` 路径会转发给 Anthropic。CA 不会安装到操作系统
+信任存储中，只有读取 `NODE_EXTRA_CA_CERTS` 的 Node 进程会信任它。
+
+模式保存在 `claudeCode.desktopMode`。此前明确应用第一方模式或在本版本之前应用过
+第一方模式的安装会保留该模式；现有网关安装也保持不变。没有明确设置时，依次检查
+OpenCodex 拥有的已选网关条目、保存的网关指纹、`settings.json` 中属于 OpenCodex 的
+第一方设置；都没有时使用网关。目录同步和模型列表更新绝不会在已解析为第一方模式的
+安装上写入网关配置档案。若 `claudeCode.intercept.enabled: false`，现有第一方安装的
+应用操作会以 `intercept_disabled` 拒绝，新安装则应用网关。不会覆盖其他代理的设置。
+切换模式后请完全退出并重新打开 Desktop。
+
+### Picker 模式：在第一方 Code 标签页中显示 opencodex 模型
+
+Picker 模式是第一方模式的一部分。在 macOS 上选择第一方时默认开启；设置
+`claudeCode.intercept.picker: false` 后会保持关闭。它会修改第一方 Desktop 的 Code 标签页模型选择器，
+按名称列出可用的 opencodex 模型。首次开启时，macOS 可能会要求你在登录钥匙串中信任本地证书颁发机构。
+该颁发机构限制为 `claude.ai` 及其子域名；这个提示是对该本地 CA 的一次性信任步骤。
+
+Picker 模式开启期间，Claude Desktop 通过 OpenCodex 访问网络。如果 OpenCodex 停止，Desktop 会处于离线状态，
+直到你完全重启 Desktop 或关闭 Picker 模式。使用 `ocx claude desktop picker status` 查看状态，使用
+`ocx claude desktop picker trust` 重复信任步骤，或使用 `ocx claude desktop picker off` 关闭。
+控制台 **Claude → Desktop** 中也有同样的开关。选择 Picker 配置档案后，请完全退出并重新打开 Claude Desktop。
+
+Picker 模式属于第一方模式，因此[第一方账户风险](#第一方主动选择)同样适用。
+
 ## 连接远程 hub 的 Claude Desktop
 
 已连接的机器运行 `ocx claude desktop apply` 或 `ocx claude desktop` 时，会读取 hub 的

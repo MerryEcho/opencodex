@@ -253,7 +253,7 @@ configured Anthropic upstream. The pair is on by default on a hub (`claudeCode.i
 its proxy port defaults to the public port + 100 (`claudeCode.intercept.port`), and a bind failure
 degrades to a startup warning rather than a startup failure; stop joins both sockets. A server asked
 for an ephemeral public port (`startServer(0)`, the shape every in-process test fixture uses) has no
-stable port to derive from, so the pair stays off unless `claudeCode.intercept.port` is explicit. Requests on this ingress also honour first-party model bindings (`claudeCode.intercept.modelMap`); see [Claude Desktop](clients/claude-desktop.md#first-party-model-bindings).
+stable port to derive from, so the pair stays off unless `claudeCode.intercept.port` is explicit. Requests on this ingress also honour first-party model bindings (`claudeCode.intercept.modelMap`); see [Claude Desktop](clients/claude-desktop.md#first-party-model-bindings). Picker mode adds a second, Desktop-only CONNECT proxy on the next port; see [Claude Desktop](clients/claude-desktop.md#picker-mode-the-desktop-egress-proxy).
 
 Auxiliary listener bind failures carry the listener key and effective address through `AuxiliaryListenerBindError` in `src/server/ports.ts`. `src/cli/index.ts` reports them without retrying the public port. Startup still rolls back every earlier socket synchronously.
 

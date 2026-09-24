@@ -97,28 +97,57 @@ hook を削除します。Claude Desktop は独立した profile を使用し、
 `claudeCode.nativePassthrough: false` でオフにでき、`claudeCode.anthropicBaseUrl` で別のアドレスを
 指定できます。
 
-## Claude Desktop のモード: 1P（デフォルト）とゲートウェイ
+## Claude Desktop のモード: ゲートウェイ（デフォルト）と 1P
 
-Claude Desktop は排他的な 2 つのモードのどちらかで OpenCodex を使います。ダッシュボードの
-**Claude → Desktop → 接続モード**、または `ocx claude desktop apply --first-party|--gateway` で選びます。
+ダッシュボードの **Claude → Desktop → 接続モード**、または
+`ocx claude desktop apply --first-party|--gateway` で排他的なモードを選びます。
 
-- **1P（ファーストパーティ、デフォルト）**: Desktop 本体は変更しません。claude.ai のログイン、
-  チャットタブ、コネクタ、リモート操作はそのまま動きます。OpenCodex は `~/.claude/settings.json` の
-  `env` に `HTTPS_PROXY=http://127.0.0.1:<公開ポート+100>` と
-  `NODE_EXTRA_CA_CERTS=~/.opencodex/claude-intercept/ca.pem` の 2 つだけを書きます。Desktop が
-  Code タブ用に起動する Claude Code（サブエージェント含む）とターミナルの `claude` CLI だけがこれを読み、
-  ローカルのインターセプトプロキシを通ります。`POST /v1/messages` と `count_tokens` のみ OpenCodex が
-  処理し、他の `api.anthropic.com` パスはそのまま Anthropic に中継されます。CA は OS の信頼ストアには
-  インストールされません。
-- **ゲートウェイ（3P）**: 従来の方式で、下記のプロファイルによりアプリ全体が OpenCodex を
-  ゲートウェイとして使います。`--gateway`（または従来の `--static`/`--hybrid`/`--discovery-only`）で
-  明示的に選びます。
+### ゲートウェイ（デフォルト）
 
-モードは `claudeCode.desktopMode` に保存されます。すでにゲートウェイプロファイルを適用済みの環境は
-更新後もゲートウェイのままで、新規インストールだけが 1P になります。切り替えると他方のモードの設定
-（OpenCodex が書いた値のみ）が削除され、社内プロキシなど外部の `HTTPS_PROXY`/`NODE_EXTRA_CA_CERTS`
-は上書きせず適用を拒否します。切り替え後は Desktop を完全に終了して再起動してください。詳細と
-Claude Code CLI 互換性は英語版ドキュメントを参照してください。
+新規インストールではゲートウェイプロファイルが適用され、Chat タブを含むアプリ全体が
+OpenCodex を使います。claude.ai 専用の機能は利用できません。従来の `--static`、`--hybrid`、
+`--discovery-only` もゲートウェイを選びます。
+
+### 1P（オプトイン）
+
+:::caution[アカウントのリスク]
+1P モードでは Claude サブスクリプションの通信がローカルのインターセプトプロキシを通ります。
+Anthropic がこれを利用規約違反とみなし、アカウントを停止する可能性があります。デフォルトは
+ゲートウェイです。このリスクを受け入れる場合にのみ 1P を選んでください。
+:::
+
+Desktop 本体は claude.ai に接続したままで、Chat、コネクタ、リモート操作も使えます。
+OpenCodex が書くのは `~/.claude/settings.json`（`CLAUDE_CONFIG_DIR` に対応）の `env` にある
+`HTTPS_PROXY` と `NODE_EXTRA_CA_CERTS` だけです。Code タブが起動する Claude Code、
+サブエージェント、ターミナルの `claude` CLI がローカルプロキシを通ります。その他の
+`api.anthropic.com` パスは Anthropic に中継されます。CA は OS の信頼ストアに入れず、
+`NODE_EXTRA_CA_CERTS` を読む Node プロセスだけが信頼します。
+
+モードは `claudeCode.desktopMode` に保存されます。明示的に、またはこの更新以前に 1P を
+適用した環境は 1P を維持し、既存のゲートウェイも維持します。明示設定がない場合は、
+OpenCodex 所有の選択済みゲートウェイ行、保存済みのゲートウェイ指紋、所有する
+`settings.json` の 1P 設定の順に判定し、証拠がなければゲートウェイです。
+カタログ同期やモデル一覧の更新が 1P 環境にゲートウェイプロファイルを書くことはありません。
+`claudeCode.intercept.enabled: false` なら既存の 1P 環境での適用は
+`intercept_disabled` で拒否され、新規環境はゲートウェイを適用します。外部の企業プロキシ
+設定は上書きしません。モード変更後は Desktop を完全に終了して開き直してください。
+
+### Picker モード: 1P の Code タブで opencodex モデルを表示する
+
+Picker モードは 1P モードの一部です。macOS で 1P を選ぶとデフォルトで有効になりますが、
+`claudeCode.intercept.picker: false` を設定した場合は無効です。1P の Desktop の Code タブにある
+モデルピッカーを書き換え、利用できる opencodex モデルを名前付きで表示します。初回の有効化時は、
+macOS がログインキーチェーン内のローカル証明書認証局を信頼するよう求めることがあります。この認証局の
+制約は `claude.ai` とそのサブドメインに限られ、このダイアログはこのローカル CA に対する一度だけの
+信頼操作です。
+
+Picker モードが有効な間、Claude Desktop のネットワークは OpenCodex を経由します。OpenCodex が停止
+すると、Picker モードをオフにするか Desktop を完全に再起動するまで Desktop はオフラインになります。
+状態は `ocx claude desktop picker status`、信頼操作は `ocx claude desktop picker trust` で確認・実行できます。
+`ocx claude desktop picker off` またはダッシュボードの **Claude → Desktop** の切り替えでオフにできます。
+Picker プロファイルを選択した後は、Claude Desktop を完全に終了して開き直してください。
+
+Picker モードは 1P の一部なので、[1P のアカウントリスク](#1pオプトイン)も同じように適用されます。
 
 ### Code タブで opencodex モデルを使う（1P バインディング）
 
