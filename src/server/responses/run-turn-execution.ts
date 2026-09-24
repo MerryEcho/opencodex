@@ -22,7 +22,6 @@ import type { AdapterEvent, OcxProviderContinuationState } from "../../types";
 import { adapterFailureFromMessage, SEND_BUDGET_EXHAUSTED_CODE } from "../../lib/errors";
 import { SendBudgetExhaustedError } from "../../lib/upstream-retry";
 import {
-  GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST,
   genericOAuthMaxFailovers,
   isGenericOAuthFailoverEnabled,
   isGenericOAuthFailoverStatus,
