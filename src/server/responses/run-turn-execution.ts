@@ -271,7 +271,6 @@ export async function executeResponsesRunTurn(
         null,
         Date.now(),
         route.modelId,
-        error.message,
       );
       if (!nextAccountId) {
         hop.permit?.release();
