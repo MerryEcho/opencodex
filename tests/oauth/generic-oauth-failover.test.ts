@@ -769,6 +769,9 @@ describe("Antigravity 403/401 failover and proactive steering", () => {
 
     const now = Date.now();
     expect(rotateGenericOAuthAccountOnError(
+      gaConfig, "google-antigravity", ids[0]!, 403, null, now,
+    )).toBeNull();
+    expect(rotateGenericOAuthAccountOnError(
       gaConfig, "google-antigravity", ids[0]!, 403, null, now, undefined, "PERMISSION_DENIED",
     )).toBeNull();
     expect(getAccountHealthRecord("google-antigravity", ids[0]!)).toBeUndefined();
