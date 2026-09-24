@@ -43,6 +43,7 @@ import {
   genericOAuthMaxFailovers,
   isGenericOAuthFailoverEnabled,
   isGenericOAuthFailoverStatus,
+  readGenericOAuthFailoverClassification,
   rotateGenericOAuthAccountOnError,
   rotateGenericOAuthAccountOn429,
   failoverAccountSnapshot,
@@ -424,6 +425,9 @@ export function createAdapterContinuations(
           `${route.providerName}|${route.modelId}|continuation-oauth-failover`,
           !adapterOwnsDispatch && transientRetryPolicyFor(route.provider) !== null,
         );
+        const errorClassification = hop.allowed && response.status === 403
+          ? await readGenericOAuthFailoverClassification(response, route.providerName, upstream.signal)
+          : undefined;
         const nextAccountId = hop.allowed
           ? rotateGenericOAuthAccountOnError(
             config,
@@ -433,6 +437,7 @@ export function createAdapterContinuations(
             response.headers.get("retry-after"),
             Date.now(),
             route.modelId,
+            errorClassification,
           )
           : null;
         // Eligible and refused by the shared budget, as opposed to eligible and finding no next
