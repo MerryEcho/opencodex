@@ -813,9 +813,12 @@ Leave this disabled unless you understand Anthropic account policy risk. Prefer 
 
 Rotates to another logged-in account of the same provider when one is rate-limited, for OAuth
 providers that have no pool of their own — xAI, Cursor, Kimi, GitHub Copilot, Google Antigravity,
-and Nous.
+and Nous. Google Antigravity also rotates on `401`, and on `403` only when a bounded error-body
+inspection identifies `VALIDATION_REQUIRED`. Raw provider error text is not stored in account
+health; flagged Antigravity accounts are rechecked after cooldown through the existing bounded
+quota/model probe and return to rotation only after a successful check.
 
-**Logging in a second account is what turns this on, and nothing turns it off.** Rotation
+**Logging in a second account is what turns reactive recovery on, and nothing turns it off.** Rotation
 activates for any of those providers holding 2 or more accounts that are not flagged for
 reauthentication — the same rule `apiKeyPool` already applies to a 2+ key pool. A provider with
 one stored account behaves exactly as before.
