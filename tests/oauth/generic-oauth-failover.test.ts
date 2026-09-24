@@ -15,6 +15,7 @@ import {
   isGenericFailoverProvider,
   isGenericOAuthFailoverEnabled,
   isGenericOAuthFailoverStatus,
+  isGenericOAuthFailoverResponse,
   loadHealthCache,
   noteGenericPoolSelection,
   preferredInitialAccount,
@@ -739,6 +740,25 @@ describe("Antigravity 403/401 failover and proactive steering", () => {
     expect(isGenericOAuthFailoverStatus(403, "google-antigravity", "PERMISSION_DENIED")).toBe(false);
     expect(isGenericOAuthFailoverStatus(403, "google-antigravity", "VALIDATION_REQUIRED")).toBe(true);
     expect(isGenericOAuthFailoverStatus(200, "google-antigravity")).toBe(false);
+  });
+
+  test("bounded 403 response classification fails closed", async () => {
+    expect(await isGenericOAuthFailoverResponse(
+      new Response(JSON.stringify({ error: { details: [{ reason: "VALIDATION_REQUIRED" }] } }), { status: 403 }),
+      "google-antigravity",
+    )).toBe(true);
+    expect(await isGenericOAuthFailoverResponse(
+      new Response(JSON.stringify({ error: { message: "PERMISSION_DENIED" } }), { status: 403 }),
+      "google-antigravity",
+    )).toBe(false);
+    expect(await isGenericOAuthFailoverResponse(
+      new Response(`${"x".repeat(5000)}VALIDATION_REQUIRED`, { status: 403 }),
+      "google-antigravity",
+    )).toBe(false);
+    expect(await isGenericOAuthFailoverResponse(
+      new Response("VALIDATION_REQUIRED", { status: 403 }),
+      "xai",
+    )).toBe(false);
   });
 
   test("403 rotates only after VALIDATION_REQUIRED classification", async () => {
