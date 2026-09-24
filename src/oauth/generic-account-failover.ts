@@ -619,6 +619,7 @@ export function rotateGenericOAuthAccountOnError(
   errorText?: string,
 ): string | null {
   if (!isGenericOAuthFailoverStatus(status, providerName, errorText)) return null;
+  if (status === 403 && !isAntigravityValidationRequired(errorText)) return null;
   if (status === 429) {
     return rotateGenericOAuthAccountOn429(
       config,
