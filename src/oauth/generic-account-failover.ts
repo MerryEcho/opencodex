@@ -38,13 +38,11 @@ import {
 } from "./pool-kernel";
 import { parseRetryAfterMs } from "../combos/failover";
 import { sweepExpiredOnWrite } from "../lib/state-store-sweeper";
-import { ANTIGRAVITY_REQUEST_UA } from "../adapters/google-antigravity-wire";
-import { resolveAntigravityEffortWireModel } from "../providers/antigravity-models";
-import { getProviderRegistryEntry } from "../providers/registry";
+import { readBoundedResponseBody } from "../lib/bounded-body";
 import type { OcxConfig, OcxProviderConfig } from "../types";
 
-/** Cap same-request rotations so a short Retry-After cannot spin. Default raised to accommodate multi-account pools. */
-export const GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST = 15;
+/** Legacy/default same-request rotation floor. Dynamic paths scale from this floor per pool. */
+export const GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST = 3;
 
 /** Dynamic per-request failover cap based on account pool size. */
 export function genericOAuthMaxFailovers(providerName?: string): number {
@@ -473,66 +471,33 @@ export function noteGenericPoolSelection(
 
 
 /**
- * Cool the account that actually 429'd and name the next eligible one, or null.
+ * Pick the next eligible account after the failed one without changing health state.
  *
- * Returns the id only; the caller mints the credential so a failed refresh does not leave the
- * cooldown applied to an account we then could not use.
+ * Health recording stays with the failure-specific caller: quota failures write a family
+ * cooldown, while auth failures write only the account-level auth verdict.
  */
-export function rotateGenericOAuthAccountOn429(
+function nextGenericOAuthFailoverAccount(
   config: OcxConfig,
   providerName: string,
   failedAccountId: string,
-  retryAfterHeader: string | null | undefined,
-  now = Date.now(),
+  now: number,
   requestedModelId?: string | null,
-  cooldownOverrideMs?: number,
 ): string | null {
-  if (!isGenericOAuthFailoverEnabled(config, providerName)) return null;
   const set = getAccountSet(providerName);
-  // A single stored account has nowhere to go; rotating to itself would just replay the 429.
   if (!set || set.accounts.length < 2) return null;
-
-  const parsed = parseRetryAfterMs(retryAfterHeader, now, { preserveImmediate: true });
-  // An account whose allowance is provably spent gets a reset-aligned cooldown instead of
-  // the default minute: retrying it every 60s until the window rolls over is pure waste.
-  // A Retry-After from upstream still wins — it is the server's own instruction.
-  const exhausted = parsed === undefined ? exhaustedCooldownMs(providerName, failedAccountId, now) : null;
-  const cooldownMs = cooldownOverrideMs ?? exhausted ?? Math.min(parsed ?? DEFAULT_COOLDOWN_MS, MAX_COOLDOWN_MS);
   const family = classifyModelFamilyForQuota(providerName, requestedModelId);
-  const key = healthKey(providerName, failedAccountId, family);
-  const existing = health.get(key) ?? health.get(healthKey(providerName, failedAccountId));
-  health.set(key, {
-    status: existing?.status === "validation_required" ? "validation_required" : "quota_exhausted",
-    cooldownUntil: now + cooldownMs,
-    cooldownSource: parsed ? "retry-after" : "default",
-    lastCheckedAt: now,
-    lastVerifiedAt: existing?.lastVerifiedAt,
-    lastError: existing?.lastError,
-    family,
-  });
-  saveHealthCache();
-  sweepExpiredOnWrite(now);
-
   const eligible = eligibleFailoverAccounts(providerName, now, family).filter(id => id !== failedAccountId);
   if (eligible.length === 0) return null;
-  // A rotation means the roster in use just changed; do not answer the next activation question
-  // from a count read before the failure.
+
   presence.delete(providerName);
-  // Deterministic: start after the failed account so repeated 429s walk the roster instead of
-  // hammering whichever id happens to sort first. The ring is built BEFORE ranking — ranking
-  // the store's own order would change which account a quota-less provider rotates to.
   const order = set.accounts.map(account => account.id);
   const start = order.indexOf(failedAccountId);
   const ring = start >= 0 ? [...order.slice(start + 1), ...order.slice(0, start)] : order;
   const candidates = ring.filter(id => id !== failedAccountId && eligible.includes(id));
   if (candidates.length === 0) return null;
-  // The 429 path branches too. Leaving it on the quota ranking would make a configured
-  // strategy inert in practice the moment anything actually failed, which is the case the
-  // operator chose the strategy for.
+
   const strategy = activeGenericStrategy(config, providerName);
   if (strategy === "round-robin") {
-    // PICK here, not peek: the failure already happened and this answer is the one being used,
-    // so the ring genuinely advances.
     return pickRoundRobinAccount(
       genericPoolKey(providerName),
       candidates,
@@ -540,8 +505,6 @@ export function rotateGenericOAuthAccountOn429(
     );
   }
   if (strategy === "fill-first") {
-    // Not "keep the active account": the one that just 429'd is cooled, so fill-first takes
-    // the next eligible account in the stable ring rather than its usual hold.
     const stableAll = stableGenericRoster(providerName);
     const from = stableAll.indexOf(failedAccountId);
     const walk = from >= 0 ? [...stableAll.slice(from + 1), ...stableAll.slice(0, from)] : stableAll;
@@ -550,27 +513,96 @@ export function rotateGenericOAuthAccountOn429(
     }
     return null;
   }
-  // With no quota evidence this returns the ring untouched, so providers without
-  // per-account quota keep exactly the traversal they have today.
   return rankAccountsByHeadroom(providerName, candidates, requestedModelId)[0] ?? null;
 }
 
 /**
- * Statuses that warrant rotating to the next account in the pool.
- * - 429: Rate limit / Quota exhausted
- * - 403: Forbidden / Permission Denied / Verification required (e.g. Google Cloud Code Assist VALIDATION_REQUIRED)
- * - 401: Unauthorized / Expired / Revoked token
+ * Cool the account that actually 429'd and name the next eligible one, or null.
  */
-export function isGenericOAuthFailoverStatus(status: number, providerName?: string): boolean {
-  if (status === 429) return true;
-  if (status === 403 || status === 401) return true;
-  return false;
+export function rotateGenericOAuthAccountOn429(
+  config: OcxConfig,
+  providerName: string,
+  failedAccountId: string,
+  retryAfterHeader: string | null | undefined,
+  now = Date.now(),
+  requestedModelId?: string | null,
+): string | null {
+  if (!isGenericOAuthFailoverEnabled(config, providerName)) return null;
+  const set = getAccountSet(providerName);
+  if (!set || set.accounts.length < 2) return null;
+
+  const parsed = parseRetryAfterMs(retryAfterHeader, now, { preserveImmediate: true });
+  const exhausted = parsed === undefined ? exhaustedCooldownMs(providerName, failedAccountId, now) : null;
+  const cooldownMs = exhausted ?? Math.min(parsed ?? DEFAULT_COOLDOWN_MS, MAX_COOLDOWN_MS);
+  const family = classifyModelFamilyForQuota(providerName, requestedModelId);
+  const key = healthKey(providerName, failedAccountId, family);
+  const existing = health.get(key) ?? health.get(healthKey(providerName, failedAccountId));
+  health.set(key, {
+    status: "quota_exhausted",
+    cooldownUntil: now + cooldownMs,
+    cooldownSource: parsed ? "retry-after" : "default",
+    lastCheckedAt: now,
+    lastVerifiedAt: existing?.lastVerifiedAt,
+    family,
+  });
+  saveHealthCache();
+  sweepExpiredOnWrite(now);
+  return nextGenericOAuthFailoverAccount(config, providerName, failedAccountId, now, requestedModelId);
+}
+
+const ANTIGRAVITY_FAILOVER_PROVIDER = "google-antigravity";
+const FAILOVER_CLASSIFICATION_MAX_BYTES = 4 * 1024;
+const FAILOVER_CLASSIFICATION_TIMEOUT_MS = 2_000;
+
+function isAntigravityValidationRequired(text: string | undefined): boolean {
+  return typeof text === "string" && text.includes("VALIDATION_REQUIRED");
 }
 
 /**
- * Rotate account on 429 or auth/permission errors (403/401).
- * For 403/401, records health status dynamically in ~/.opencodex/oauth-account-health.json
- * without mutating auth.json credentials.
+ * 429 remains generic. Auth/permission rotation is intentionally Antigravity-only, and a 403
+ * is eligible only when its bounded error body explicitly identifies VALIDATION_REQUIRED.
+ */
+export function isGenericOAuthFailoverStatus(
+  status: number,
+  providerName?: string,
+  errorText?: string,
+): boolean {
+  if (status === 429) return true;
+  if (providerName !== ANTIGRAVITY_FAILOVER_PROVIDER) return false;
+  if (status === 401) return true;
+  return status === 403 && isAntigravityValidationRequired(errorText);
+}
+
+/**
+ * Read only enough of an Antigravity 403 to classify VALIDATION_REQUIRED.
+ * The text is never persisted or logged; incomplete, oversized, timed-out, or aborted reads
+ * fail closed and leave the original response untouched for the client.
+ */
+export async function readGenericOAuthFailoverClassification(
+  response: Response,
+  providerName: string,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
+  if (providerName !== ANTIGRAVITY_FAILOVER_PROVIDER || response.status !== 403) return undefined;
+  try {
+    const observed = await readBoundedResponseBody(response.clone(), {
+      signal,
+      maxBytes: FAILOVER_CLASSIFICATION_MAX_BYTES,
+      totalTimeoutMs: FAILOVER_CLASSIFICATION_TIMEOUT_MS,
+      firstByteTimeoutMs: FAILOVER_CLASSIFICATION_TIMEOUT_MS,
+      inactivityTimeoutMs: FAILOVER_CLASSIFICATION_TIMEOUT_MS,
+    });
+    return observed.displaySafe ? observed.text : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Rotate after a classified generic OAuth failure.
+ *
+ * 401/403 auth health is account-scoped. It deliberately does not reuse the 429 writer, because
+ * that would also create a family-scoped quota_exhausted record for an authentication failure.
  */
 export function rotateGenericOAuthAccountOnError(
   config: OcxConfig,
@@ -580,14 +612,27 @@ export function rotateGenericOAuthAccountOnError(
   retryAfterHeader?: string | null,
   now = Date.now(),
   requestedModelId?: string | null,
+  errorText?: string,
 ): string | null {
-  if (status === 403) {
-    recordAccountValidationRequired(providerName, failedAccountId, now);
-  } else if (status === 401) {
-    recordAccountAuthFailure(providerName, failedAccountId, now);
+  if (!isGenericOAuthFailoverStatus(status, providerName, errorText)) return null;
+  if (status === 429) {
+    return rotateGenericOAuthAccountOn429(
+      config,
+      providerName,
+      failedAccountId,
+      retryAfterHeader,
+      now,
+      requestedModelId,
+    );
   }
-  const cooldownOverrideMs = status === 403 ? 30 * 60_000 : status === 401 ? 15 * 60_000 : undefined;
-  return rotateGenericOAuthAccountOn429(config, providerName, failedAccountId, retryAfterHeader, now, requestedModelId, cooldownOverrideMs);
+  if (!isGenericOAuthFailoverEnabled(config, providerName)) return null;
+  const set = getAccountSet(providerName);
+  if (!set || set.accounts.length < 2) return null;
+
+  if (status === 403) recordAccountValidationRequired(providerName, failedAccountId, now);
+  else recordAccountAuthFailure(providerName, failedAccountId, now);
+  sweepExpiredOnWrite(now);
+  return nextGenericOAuthFailoverAccount(config, providerName, failedAccountId, now, requestedModelId);
 }
 
 /**
@@ -699,9 +744,12 @@ export function genericFailoverRetryAfterSeconds(providerName: string, now = Dat
   if (!set) return null;
   let earliest: number | null = null;
   for (const account of set.accounts) {
-    const entry = health.get(healthKey(providerName, account.id));
-    if (!entry || entry.cooldownUntil <= now) continue;
-    if (earliest === null || entry.cooldownUntil < earliest) earliest = entry.cooldownUntil;
+    const accountKey = healthKey(providerName, account.id);
+    for (const [key, entry] of health) {
+      if (key !== accountKey && !key.startsWith(`${accountKey}\u0000`)) continue;
+      if (entry.cooldownUntil <= now) continue;
+      if (earliest === null || entry.cooldownUntil < earliest) earliest = entry.cooldownUntil;
+    }
   }
   return earliest === null ? null : Math.max(1, Math.ceil((earliest - now) / 1000));
 }
@@ -728,104 +776,55 @@ export function clearGenericFailoverHealth(providerName?: string): void {
   saveHealthCache();
 }
 
-/** Probe an account against upstream to verify whether it can serve requests. */
+/** Probe a flagged Antigravity account through the existing bounded quota/model probe. */
 export async function probeGenericOAuthAccount(
   providerName: string,
   accountId: string,
-): Promise<{ ok: boolean; status: number; reason?: string }> {
-  if (providerName === "google-antigravity") {
-    try {
-      const snap = await getValidAccessSnapshotForAccount("google-antigravity", accountId);
-      if (!snap.accessToken || !snap.projectId) {
-        return { ok: false, status: 401, reason: "Missing accessToken or projectId" };
-      }
-      const registry = getProviderRegistryEntry("google-antigravity");
-      if (!registry?.defaultModel) {
-        return { ok: false, status: 500, reason: "Antigravity probe metadata unavailable" };
-      }
-      const baseUrl = registry.baseUrl.endsWith("/") ? registry.baseUrl : `${registry.baseUrl}/`;
-      const endpoint = new URL("./v1internal:generateContent", baseUrl);
-      const { wireModelId } = resolveAntigravityEffortWireModel(
-        registry.defaultModel,
-        undefined,
-        registry.baseUrl,
-      );
-      const res = await fetch(endpoint, {
-        method: "POST",
-        signal: AbortSignal.timeout(20_000),
-        headers: {
-          "Authorization": `Bearer ${snap.accessToken}`,
-          "Content-Type": "application/json",
-          "User-Agent": ANTIGRAVITY_REQUEST_UA,
-          "x-goog-api-client": "google-cloud-code-assist/0.1.0",
-        },
-        body: JSON.stringify({
-          model: wireModelId,
-          userAgent: "antigravity",
-          requestType: "agent",
-          project: snap.projectId,
-          request: {
-            contents: [{ role: "user", parts: [{ text: "ping" }] }],
-            generationConfig: { maxOutputTokens: 1 },
-          },
-        }),
-      });
-      if (res.status === 200) {
-        return { ok: true, status: 200 };
-      }
-      if (res.status === 403) {
-        return { ok: false, status: 403, reason: "HTTP 403: VALIDATION_REQUIRED" };
-      }
-      if (res.status === 401) {
-        return { ok: false, status: 401, reason: "HTTP 401: Unauthorized" };
-      }
-      return { ok: false, status: res.status };
-    } catch (err: any) {
-      return { ok: false, status: 500, reason: err?.message || String(err) };
-    }
+): Promise<{ ok: boolean; status: number }> {
+  if (providerName !== ANTIGRAVITY_FAILOVER_PROVIDER) return { ok: false, status: 501 };
+  try {
+    const snap = await getValidAccessSnapshotForAccount(ANTIGRAVITY_FAILOVER_PROVIDER, accountId);
+    if (!snap.accessToken || !snap.projectId) return { ok: false, status: 401 };
+    // Dynamic import keeps the quota transport out of the hot request-path module graph.
+    const { probeAntigravityUsageQuota } = await import("../providers/quota/antigravity");
+    const result = await probeAntigravityUsageQuota(snap.accessToken, snap.projectId);
+    if (result.kind === "available") return { ok: true, status: 200 };
+    if (result.failure === "access_denied") return { ok: false, status: 403 };
+    if (result.failure === "rate_limited") return { ok: false, status: 429 };
+    return { ok: false, status: 500 };
+  } catch {
+    return { ok: false, status: 500 };
   }
-  return { ok: true, status: 200 };
 }
 
-/** Background sweep to probe accounts in cooldown or validation_required state, auto-restoring re-verified accounts. */
-export async function sweepAndHealAccounts(providerName = "google-antigravity"): Promise<void> {
+const HEALTH_SWEEP_INTERVAL_MS = 10 * 60_000;
+
+/** Probe only accounts already flagged by a real Antigravity auth failure. */
+export async function sweepAndHealAccounts(providerName = ANTIGRAVITY_FAILOVER_PROVIDER): Promise<void> {
   ensureHealthCache();
+  if (providerName !== ANTIGRAVITY_FAILOVER_PROVIDER) return;
   const set = getAccountSet(providerName);
   if (!set || set.accounts.length === 0) return;
   const now = Date.now();
 
   for (const account of set.accounts) {
     const entry = health.get(healthKey(providerName, account.id));
-    const needsProbe = !entry
-      || ((entry.status === "validation_required" || entry.status === "auth_failure")
-        && entry.cooldownUntil <= now)
-      || entry.status === "unknown"
-      || (entry.status === "healthy" && now - entry.lastCheckedAt > 24 * 60 * 60_000);
-
-    if (!needsProbe) continue;
+    const flagged = entry?.status === "validation_required" || entry?.status === "auth_failure";
+    if (!entry || !flagged || entry.cooldownUntil > now) continue;
+    if (now - entry.lastCheckedAt < HEALTH_SWEEP_INTERVAL_MS) continue;
 
     const result = await probeGenericOAuthAccount(providerName, account.id);
     if (result.ok) {
-      const wasBad = entry
-        && (entry.status === "validation_required" || entry.status === "auth_failure");
       recordAccountHealthy(providerName, account.id, now);
-      if (wasBad) {
-        console.log(`[opencodex] Self-healing: account ${providerName}/${account.id.slice(0, 8)} re-verified & restored to rotation pool!`);
-      }
-    } else if (result.status === 403) {
-      recordAccountValidationRequired(providerName, account.id, now);
-    } else if (result.status === 429) {
-      const key = healthKey(providerName, account.id);
-      health.set(key, {
-        status: "quota_exhausted",
-        cooldownUntil: now + 60_000,
-        cooldownSource: "probe",
-        lastCheckedAt: now,
-      });
-      saveHealthCache();
-    } else if (result.status === 401) {
-      recordAccountAuthFailure(providerName, account.id, now);
+      console.log(`[opencodex] Self-healing: account ${providerName}/${account.id.slice(0, 8)} re-verified & restored to rotation pool!`);
+      continue;
     }
+
+    // A failed probe is evidence only that the account is still unavailable. Preserve the
+    // request-path classification and advance the check timestamp so non-200 results do not
+    // turn into an eager retry loop.
+    health.set(healthKey(providerName, account.id), { ...entry, lastCheckedAt: now });
+    saveHealthCache();
   }
 }
 
@@ -833,13 +832,13 @@ export function startGenericAccountHealthSweep(): void {
   if (sweepTimer) return;
   sweepStartTimer = setTimeout(() => {
     sweepStartTimer = null;
-    void sweepAndHealAccounts("google-antigravity");
+    void sweepAndHealAccounts(ANTIGRAVITY_FAILOVER_PROVIDER);
   }, 5_000);
   sweepStartTimer.unref?.();
 
   sweepTimer = setInterval(() => {
-    void sweepAndHealAccounts("google-antigravity");
-  }, 10 * 60_000);
+    void sweepAndHealAccounts(ANTIGRAVITY_FAILOVER_PROVIDER);
+  }, HEALTH_SWEEP_INTERVAL_MS);
   sweepTimer.unref?.();
 }
 
