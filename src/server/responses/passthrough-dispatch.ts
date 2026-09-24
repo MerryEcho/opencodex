@@ -133,7 +133,6 @@ import type { OAuthAccessSnapshot } from "../../oauth";
 import { publicOAuthAuthenticationErrorMessage } from "../../oauth";
 import { resolveCopilotApiBaseUrl } from "../../oauth/github-copilot";
 import {
-  GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST,
   genericOAuthMaxFailovers,
   isGenericOAuthFailoverEnabled,
   isGenericOAuthFailoverStatus,
