@@ -56,6 +56,7 @@ import {
   genericOAuthMaxFailovers,
   isGenericOAuthFailoverEnabled,
   isGenericOAuthFailoverStatus,
+  readGenericOAuthFailoverClassification,
   rotateGenericOAuthAccountOnError,
   rotateGenericOAuthAccountOn429,
   failoverAccountSnapshot,
@@ -810,6 +811,13 @@ export async function prepareAdapterExchange(
           !adapterOwnsDispatch && transientRetryPolicyFor(route.provider) !== null,
         );
         if (!hop.allowed) break;
+        const errorClassification = upstreamResponse.status === 403
+          ? await readGenericOAuthFailoverClassification(
+            upstreamResponse,
+            route.providerName,
+            upstream.signal,
+          )
+          : undefined;
         const nextAccountId = rotateGenericOAuthAccountOnError(
           config,
           route.providerName,
@@ -818,6 +826,7 @@ export async function prepareAdapterExchange(
           upstreamResponse.headers.get("retry-after"),
           Date.now(),
           route.modelId,
+          errorClassification,
         );
         if (!nextAccountId) {
           hop.permit?.release();
