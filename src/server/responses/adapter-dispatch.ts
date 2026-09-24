@@ -52,7 +52,6 @@ import {
   formatAnthropicProviderForLog,
 } from "../../oauth/anthropic-routing";
 import {
-  GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST,
   genericOAuthMaxFailovers,
   isGenericOAuthFailoverEnabled,
   isGenericOAuthFailoverStatus,
