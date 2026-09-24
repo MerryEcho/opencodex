@@ -2,6 +2,7 @@ import { beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { MANAGED_AGENTS_TABLE_MARKER, MANAGED_SUBAGENT_DEFAULT_MARKER } from "../../src/codex/subagent-defaults";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -237,8 +238,12 @@ describe("remote hub client boundary", () => {
   test("canonicalizes origin and terminal /v1 only", () => {
     expect(normalizeHubOrigin("https://hub.example.test/v1")).toBe("https://hub.example.test");
     expect(normalizeHubOrigin("https://hub.example.test/v1/")).toBe("https://hub.example.test");
+    expect(normalizeHubOrigin("http://localhost:10100/v1")).toBe("http://localhost:10100");
+    expect(normalizeHubOrigin("http://127.0.0.1:10100")).toBe("http://127.0.0.1:10100");
+    expect(normalizeHubOrigin("http://[::1]:10100")).toBe("http://[::1]:10100");
     for (const value of [
       "ftp://hub.example.test",
+      "http://hub.example.test",
       "https://user@hub.example.test",
       "https://hub.example.test/private",
       "https://hub.example.test/?secret=1",
@@ -263,9 +268,17 @@ describe("remote hub client boundary", () => {
     }
   });
 
+  test("rejects plaintext remote discovery before sending a request", async () => {
+    let calls = 0;
+    await expect(fetchHubReady("http://hub.example.test", {
+      fetchImpl: async () => { calls += 1; return Response.json(readyBody()); },
+    })).rejects.toThrow("plaintext remote HTTP is not permitted");
+    expect(calls).toBe(0);
+  });
+
   test("admin key issuance is HTTPS-only and pairing exchanges into a full GUI session", async () => {
     let calls = 0;
-    await expect(issueClientKey("http://hub.example.test", {
+    await expect(issueClientKey("http://localhost:10100", {
       kind: "admin",
       value: new TextEncoder().encode("ocx_admin_secret"),
     }, "client", {
@@ -392,7 +405,11 @@ function runTransactionScenario(
     defaultProvider: "openai",
   };
   writeFileSync(configPath, `${JSON.stringify(originalConfig, null, 2)}\n`, "utf8");
-  if (stage !== "preflight") writeFileSync(join(codexHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+  // A missing config.toml is bootstrapped now (issue 5422), so the preflight fault is a
+  // deterministic injection refusal instead: ambiguous OpenCodex-managed sub-agent markers.
+  writeFileSync(join(codexHome, "config.toml"), stage === "preflight"
+    ? [MANAGED_AGENTS_TABLE_MARKER, "[agents]", MANAGED_SUBAGENT_DEFAULT_MARKER, "", 'default_subagent_model = "gpt-5.6-sol"', ""].join("\n")
+    : 'model_provider = "openai"\n', "utf8");
   // A catalog the user already had. Connect overwrites it; disconnect has to put it back.
   if (stage === "prior-catalog") {
     writeFileSync(join(codexHome, "opencodex-catalog.json"), PRIOR_CATALOG_BYTES, "utf8");

@@ -72,6 +72,21 @@ JSON mode: `envelope`.
 
 - Reads /healthz plus local config; drives no management API route.
 
+### `ocx resolve`
+
+One JSON document naming the config home, the effective port, and the identity-checked proxy liveness verdict.
+
+Drives no management route.
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `--json` | boolean | Emit the resolve document as JSON (the shell contract). |
+
+JSON mode: `envelope`.
+
+- Exit 0 carries a trustworthy verdict (live or proven absent); exit 1 means the CLI could not resolve and a caller must refuse to guess — unknown liveness never reads as absent.
+- Built for embedding shells (desktop app): the liveness budgets stay owned by src/server/proxy-liveness.ts.
+
 ### `ocx capabilities`
 
 List the declared CLI capabilities and the management routes they drive.
@@ -537,6 +552,25 @@ JSON mode: `payload`.
 - `store` verifies every keychain write by read-back before config.json is rewritten with keychain: references; an unavailable keychain refuses with 503 and leaves the file untouched.
 - Headless services usually have no unlocked keychain session; prefer ${ENV_VAR} references there.
 
+### `ocx companion`
+
+Inspect and configure menu-bar and widget companion usage settings.
+
+| Method | Route |
+|---|---|
+| GET | `/api/companion/settings` |
+| GET | `/api/usage/timeline` |
+| PUT | `/api/companion/settings` |
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `--json` | boolean | Emit companion settings as JSON. |
+
+JSON mode: `payload`.
+
+- `show` (the default) reads settings; `set key=value ...` updates selected settings; `reset` restores defaults.
+- Values accepted by `set` are parsed as JSON when valid, so booleans, numbers, arrays, objects, and null can be passed directly.
+
 ### `ocx account main reauth`
 
 Reauthenticate the native main Codex login with a device code (#3898); headless hubs need no Codex App or keyring.
@@ -800,14 +834,40 @@ Restart the Codex desktop app and app-servers.
 
 | Flag | Value | Meaning |
 |---|---|---|
-| `--yes` | boolean | Required: fully quits and relaunches the operator's Codex desktop app and restarts its app-servers. |
+| `--yes` | boolean | Required: fully quits and relaunches the operator's Codex desktop app, which may discard unsaved composer drafts, model-picker selections, and pending approval prompts; also restarts its app-servers. |
 | `--json` | boolean | Emit the restart result as JSON. |
 
 JSON mode: `payload`.
 
 - `sync --restart-codex` is not a substitute: it restarts only as a side effect after a catalog or cache write, so it cannot restart a healthy install on request.
 - Restarts the Codex desktop app as well as the app-servers, through the same module the CLI uses. When the proxy itself runs inside the Codex app it refuses instead, because restarting the app would kill the request.
-- --yes is mandatory because this interrupts a running editor session, which must never happen because an agent guessed a subcommand.
+- --yes is mandatory because this interrupts a running editor session and may discard unsaved composer drafts, model-picker selections, and pending approval prompts; it must never happen because an agent guessed a subcommand.
+
+### `ocx claude desktop bind`
+
+First-party: serve a Claude Desktop Code tab picker model with an opencodex route.
+
+| Method | Route |
+|---|---|
+| PUT | `/api/claude-desktop/first-party-bindings` |
+
+JSON mode: `none`.
+
+- Takes a picker model id (claude-sonnet-4-6) and a route in the Desktop route vocabulary (provider/model or native/<slug>); the route must be one the Desktop profile can offer.
+- Only Claude Code traffic that reaches the proxy through the first-party intercept (Desktop's Code tab, the claude CLI) honours it; ocx claude and the public Messages endpoint are unaffected.
+- The Desktop picker keeps Anthropic's label; the binding changes which model answers, starting with the next request.
+
+### `ocx claude desktop unbind`
+
+Remove a first-party Claude Desktop Code tab picker binding.
+
+| Method | Route |
+|---|---|
+| PUT | `/api/claude-desktop/first-party-bindings` |
+
+JSON mode: `none`.
+
+- Removing an id that is not bound is a no-op; the remaining bindings are printed.
 
 ### `ocx integration native`
 
@@ -896,6 +956,6 @@ JSON mode: `payload`.
 
 ## Counts
 
-- declared capabilities: 48
-- of those, state-changing: 24
+- declared capabilities: 52
+- of those, state-changing: 27
 - head-resolved invocations: 2

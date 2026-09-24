@@ -218,6 +218,7 @@ Combo failures are divided into **hop** failures and **terminal** failures.
 | Classified authentication, subscription, quota, rate-limit, overload, or upstream-server error | Cool the target and hop, even when the status alone is not sufficient. |
 | Client cancellation (499), `origin_rejected`, cyber-policy refusal, context overflow, or other invalid request | Stop and return the error; another target would not make the request valid. |
 | Structured HTTP 400 rejecting optional `user`, an unsupported reasoning effort, or model-scoped image input | Hop before output commitment without cooling; see request-local target compatibility below. |
+| First tool call of a Responses turn run by an in-process adapter (`runTurn`) that the current request did not declare, before any output or replay-unsafe side effect | Cool the target and hop with the same tool catalog. After visible output or a replay-unsafe side effect the refusal is final. Chat Completions and Anthropic Messages requests are unchanged. |
 | Any other unclassified error | Stop and return the error. |
 
 When `cooldownMs` is unset, a hopped target uses an upstream fallback: 5 seconds for request-rate
@@ -247,6 +248,10 @@ used by native account routing.
 :::note
 Failover is intentionally bounded. It helps with target-specific availability, authentication,
 quota, and overload failures; it does not hide caller errors or policy refusals.
+On a non-combo Responses request, an allowlisted xAI policy 403 is rewritten to HTTP 200
+`incomplete/content_filter` before Codex retries it as a transport failure; see
+[xAI policy refusals](/reference/proxy-formats/#xai-policy-refusals). Combo hops still
+classify the original HTTP 403 as a hop.
 :::
 
 For streaming requests, the upstream HTTP status is not the final decision. OpenCodex buffers a

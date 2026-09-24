@@ -1,3 +1,5 @@
+import { persistCommittedDesktopGateway } from "../../claude/desktop-gateway-state";
+import { captureDesktopAppliedMarker, commitDesktopAppliedMarker } from "../../claude/desktop-applied-marker";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import type { CatalogModel } from "../../codex/catalog";
@@ -6,6 +8,7 @@ import { mergeModelPinnedEfforts, modelPinnedEffortsConfigError } from "../../co
 import { MULTI_AGENT_SURFACE_ADVISORY_VERSION, multiAgentSurfaceAdvisory, resolveMultiAgentMode } from "../../config/multi-agent-surface";
 import { captureConfigTopLevelRollback, parsedConfigRebaseDeletionKeys, projectConfigRebaseProvenance } from "../../config/rebase-provenance";
 import {
+  adoptPersistedClaudeCode,
   DEFAULT_SUBAGENT_MODELS,
   codexAutoStartEnabled,
   deleteConfigTopLevelKey,
@@ -122,12 +125,29 @@ function persistDesktopProfileField(
 ): { ok: true } | { ok: false; reason: "missing" | "invalid" | "conflict" } {
   const outcome = mutatePersistedConfig(persisted => {
     persisted.claudeCode = { ...(persisted.claudeCode ?? {}), desktopProfile };
-    return { changed: true, value: true };
+    return { changed: true, value: structuredClone(persisted.claudeCode) };
   });
   // Only mirror into memory once the durable write actually landed; an
   // `unavailable` outcome must not leave the snapshot claiming a saved profile.
   if (outcome.status === "unavailable") return { ok: false, reason: outcome.reason };
-  config.claudeCode = { ...(config.claudeCode ?? {}), desktopProfile };
+  adoptPersistedClaudeCode(config, outcome.value);
+  return { ok: true };
+}
+
+async function persistDesktopModeField(
+  config: OcxConfig,
+  desktopMode: "first-party" | "gateway",
+): Promise<{ ok: true } | { ok: false; reason: "missing" | "invalid" | "conflict" }> {
+  const { recordClaudeDesktopMode } = await import("../../claude/desktop-first-party");
+  const outcome = mutatePersistedConfig(persisted => {
+    const mutation = recordClaudeDesktopMode(persisted, desktopMode);
+    return { changed: mutation.changed, value: structuredClone(persisted.claudeCode) };
+  });
+  if (outcome.status === "unavailable") return { ok: false, reason: outcome.reason };
+  // First-party apply ends here — no profile-marker write follows — so without
+  // adopting, live diverges from the armed baseline and a later whole-config
+  // save reads that divergence as a pending mutation and stomps hand edits.
+  adoptPersistedClaudeCode(config, outcome.value);
   return { ok: true };
 }
 
@@ -212,18 +232,22 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
       }).kind;
       if (["not_installed", "no_owned_state", "foreign", "unsafe", "broken"].includes(afterKind)) return;
       const routed = filterCatalogVisibleModels(allModels, current).map(m => ({ provider: m.provider, id: m.id, contextWindow: m.contextWindow }));
+      const writtenProfile = current.claudeCode.desktopProfile;
+      const markerBaseline = captureDesktopAppliedMarker(writtenProfile);
       const result = (deps.writeDesktop3pConfig ?? writeDesktop3pConfig)(
         current.port ?? 10100,
         [...desktopVisibleNativeSlugs(current)],
         routed,
         current.apiKeys?.[0]?.key,
         "static",
-        current.claudeCode.desktopProfile,
+        writtenProfile,
         nativeContextLimits(current),
       );
       if (result.written && result.fingerprint) {
-        current.claudeCode = { ...current.claudeCode, desktopProfile: { ...current.claudeCode.desktopProfile, appliedFingerprint: result.fingerprint, appliedAt: new Date().toISOString() } };
-        saveConfigPreservingClaudeCode(current);
+        const marked = commitDesktopAppliedMarker(markerBaseline, result.fingerprint);
+        if (marked.status === "unavailable" || marked.value === false) {
+          console.warn("[claude-desktop] provider-change applied marker skipped");
+        }
       }
     } catch { /* best-effort */ }
   }
@@ -966,9 +990,10 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
     let body: { profile?: unknown };
     try { body = await readManagementJsonBody(req); } catch (error) { rethrowManagementBodyTooLarge(error); return jsonResponse({ error: "invalid JSON body" }, 400); }
     try {
-      const { parseDesktopProfile, reconcileDesktopProfile } = await import("../../claude/desktop-profile");
+      const { parseDesktopProfile, preserveDesktopAppliedState, reconcileDesktopProfile, sameProfileContent } = await import("../../claude/desktop-profile");
       const parsed = parseDesktopProfile(body.profile);
-      const current = await buildClaudeDesktopState(config);
+      const initial = loadConfig();
+      const current = await buildClaudeDesktopState(initial);
       const availableRoutes = new Set(current.models.filter(item => item.available).map(item => item.route));
       for (const route of Object.keys(parsed.assignments)) {
         if (!current.profile.assignments[route] && !availableRoutes.has(route)) {
@@ -989,9 +1014,39 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
           throw new Error(`현재 사용할 수 없는 모델은 기본값으로 지정할 수 없습니다: ${nextDefault}`);
         }
       }
-      const state = await buildClaudeDesktopState(config, parsed);
-      config.claudeCode = { ...(config.claudeCode ?? {}), desktopProfile: reconcileDesktopProfile(state.profile, state.models) };
-      saveConfigPreservingClaudeCode(config);
+      // Applied markers are server-owned bookkeeping. Discard client copies, then
+      // restore the trusted markers only if the desired profile stayed identical.
+      const editable = { version: 1 as const, assignments: parsed.assignments, defaults: parsed.defaults };
+      const state = await buildClaudeDesktopState(initial, editable);
+      const rebuilt = reconcileDesktopProfile(state.profile, state.models);
+      const expectedProfile = initial.claudeCode?.desktopProfile;
+      const outcome = mutatePersistedConfig<OcxConfig["claudeCode"] | null>(persisted => {
+        const latest = persisted.claudeCode?.desktopProfile;
+        if ((latest == null) !== (expectedProfile == null)
+          || (latest && expectedProfile && !sameProfileContent(latest, expectedProfile))) {
+          return { changed: false, value: null };
+        }
+        persisted.claudeCode = {
+          ...(persisted.claudeCode ?? {}),
+          desktopProfile: preserveDesktopAppliedState(latest ?? current.profile, rebuilt),
+        };
+        return { changed: true, value: structuredClone(persisted.claudeCode) };
+      });
+      if (outcome.status === "unavailable" && outcome.reason !== "conflict") {
+        return jsonResponse({ error: "Claude Desktop profile could not be saved (config " + outcome.reason + ")" }, 500);
+      }
+      if (outcome.status === "unavailable" || outcome.value === null) {
+        return jsonResponse({ error: "Claude Desktop profile changed during save" }, 409);
+      }
+      adoptPersistedClaudeCode(config, outcome.value);
+      // An unarmed live snapshot may prefer its old marker during reconciliation.
+      // Pin the field this route just committed while leaving other live leaves intact.
+      if (outcome.value?.desktopProfile) {
+        config.claudeCode = {
+          ...(config.claudeCode ?? {}),
+          desktopProfile: structuredClone(outcome.value.desktopProfile),
+        };
+      }
       const saved = await buildClaudeDesktopState(config);
       const runtimePort = Number(url.port) || config.port;
       return jsonResponse({ ok: true, ...saved, port: runtimePort });
@@ -1002,7 +1057,9 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
   if (url.pathname === "/api/claude-desktop/apply" && req.method === "POST") {
     try {
       // #859: the CLI delegates here so the registry is built in the serving
-      // process. Accept an optional mode; default stays static for back-compat.
+      // process. `mode` selects the Desktop mode: `first-party` (default when the
+      // install has no gateway profile) or `gateway`; the legacy gateway shapes
+      // (static/hybrid/discovery) still select gateway with that library layout.
       let mode: "static" | "hybrid" | "discovery" = "static";
       let parsed: unknown;
       try {
@@ -1011,12 +1068,17 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
         rethrowManagementBodyTooLarge(error);
         return jsonResponse({ error: "invalid JSON body" }, 400);
       }
+      const { resolveClaudeDesktopApplyMode, applyDesktopFirstParty, captureDesktopFirstPartyRollback, removeDesktopFirstParty } = await import("../../claude/desktop-first-party");
       const requested = (parsed as { mode?: unknown } | null)?.mode;
+      let desktopMode: "first-party" | "gateway" = resolveClaudeDesktopApplyMode(config);
       if (requested !== undefined) {
         if (requested === "static" || requested === "hybrid" || requested === "discovery") {
           mode = requested;
+          desktopMode = "gateway";
+        } else if (requested === "gateway" || requested === "first-party") {
+          desktopMode = requested;
         } else {
-          return jsonResponse({ error: "mode must be static, hybrid, or discovery" }, 400);
+          return jsonResponse({ error: "mode must be first-party, gateway, static, hybrid, or discovery" }, 400);
         }
       }
       // #859: a delegated CLI apply carries the profile it just saved — the
@@ -1031,6 +1093,60 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
         } catch (error) {
           return jsonResponse({ error: error instanceof Error ? error.message : String(error) }, 400);
         }
+      }
+      if (desktopMode === "first-party") {
+        const { setIntegrationEnabled } = await import("../../codex/desired-state");
+        const desired = setIntegrationEnabled("claude-desktop", true);
+        if (!desired.ok) return jsonResponse({ error: desired.message }, desired.retryable ? 409 : 500);
+        mirrorDesiredEnabledOntoSnapshot(config, "claude-desktop", true);
+        const { inspectDesktop3pConfigLibrary, removeDesktop3pStandardPivot } = await import("../../claude/desktop-3p");
+        const rollback = captureDesktopFirstPartyRollback(config);
+        const applied = applyDesktopFirstParty(config);
+        if (!applied.ok) {
+          const { firstPartyRefusalMessage } = await import("./native-integration-routes");
+          return jsonResponse({
+            error: firstPartyRefusalMessage(applied.reason, applied.path),
+            code: "claude_desktop_first_party_refused",
+            reason: applied.reason,
+            path: applied.path,
+          }, applied.reason === "foreign_env" || applied.reason === "intercept_disabled" ? 409 : 500);
+        }
+        // Remove the gateway only after the replacement env was written.
+        const appliedFingerprint = config.claudeCode?.desktopProfile?.appliedFingerprint ?? null;
+        const library = inspectDesktop3pConfigLibrary({ appliedFingerprint });
+        let gatewayRemoved = false;
+        if (library.kind === "gateway_ours" || library.kind === "gateway_drifted") {
+          const removed = (deps.removeDesktop3pStandardPivot ?? removeDesktop3pStandardPivot)({ appliedFingerprint, replaceWhileEnabled: true });
+          if (!removed.ok) {
+            const restored = removed.changed || !applied.changed || rollback();
+            const modeSaved = !removed.changed || (await persistDesktopModeField(config, "first-party")).ok;
+            const warning = [restored ? "" : "first-party settings rollback did not complete",
+              modeSaved ? "" : "first-party is active but its mode marker was not saved"].filter(Boolean).join("; ");
+            return jsonResponse({
+              error: removed.kind === "cleanup_incomplete"
+                ? "Claude Desktop now points at standard mode, but gateway credential cleanup is incomplete; the first-party connection remains active."
+                : "The gateway profile could not be removed safely, so first-party mode was not applied.",
+              code: "claude_desktop_gateway_removal_failed",
+              ...(warning ? { warning } : {}),
+              reason: removed.reason ?? removed.kind,
+              ...(removed.residualPaths ? { residualPaths: removed.residualPaths } : {}),
+            }, removed.kind === "cleanup_incomplete" ? 500 : 409);
+          }
+          gatewayRemoved = removed.changed;
+        }
+        const modeSaved = await persistDesktopModeField(config, "first-party");
+        return jsonResponse({
+          ok: true,
+          mode: "first-party",
+          saved: modeSaved.ok,
+          applied: true,
+          changed: applied.changed || gatewayRemoved,
+          gatewayRemoved,
+          path: applied.path,
+          proxyPort: applied.proxyPort,
+          caCertPath: applied.env.NODE_EXTRA_CA_CERTS,
+          ...(modeSaved.ok ? {} : { warning: `First-party env was applied, but the mode marker was not saved (${modeSaved.reason}).` }),
+        });
       }
       const { setIntegrationEnabled, claudeDesktopIntegrationEnabled } = await import("../../codex/desired-state");
       const desired = setIntegrationEnabled("claude-desktop", true);
@@ -1083,42 +1199,33 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
         nativeContextLimits(latest),
       );
       if (!result.written) return jsonResponse({ error: result.reason ?? "Claude Desktop apply failed", saved: true, path: result.path }, 500);
-      const { claudeDesktopPolicyWarning, probeClaudeDesktopPolicy } = await import("../../claude/desktop-policy");
-      const policyState = (deps.probeClaudeDesktopPolicy ?? probeClaudeDesktopPolicy)({
-        platform: deps.platform ?? process.platform,
-      });
-      const policyWarning = claudeDesktopPolicyWarning(policyState);
-      // Persist applied fingerprint + timestamp so GUI can show saved-vs-applied state.
-      if (result.fingerprint) {
-        // The Desktop write already landed, so a failed bookkeeping save is not
-        // an apply failure: report the miss instead of claiming a clean apply.
-        const marked = persistDesktopProfileField(config, {
-          ...state.profile,
-          appliedFingerprint: result.fingerprint,
-          appliedAt: new Date().toISOString(),
-        });
-        if (!marked.ok) {
-          return jsonResponse({
-            ok: true,
-            applied: true,
-            saved: false,
-            path: result.path,
-            fingerprint: result.fingerprint,
-            warning: [
-              `Claude Desktop was applied, but the applied marker was not saved (${marked.reason}).`,
-              policyWarning,
-            ].filter(Boolean).join(" "),
-          });
-        }
+      const committed = persistCommittedDesktopGateway(config, state.profile, result.fingerprint);
+      const modeWarning = committed.ok ? undefined : `Gateway applied, but its mode/profile state was not saved (${committed.reason}).`;
+      // The durable marker describes the committed gateway even if old-mode cleanup fails.
+      const firstPartyRemoved = removeDesktopFirstParty();
+      if (!firstPartyRemoved.ok) {
+        return jsonResponse({
+          error: `Claude Code settings could not be parsed (${firstPartyRemoved.path}); first-party cleanup remains incomplete after gateway apply.`,
+          code: "claude_desktop_first_party_refused", reason: firstPartyRemoved.reason,
+          applied: true, saved: committed.ok, mode: "gateway", path: result.path,
+          ...(modeWarning ? { warning: modeWarning } : {}),
+        }, 500);
       }
+      const { claudeDesktopPolicyWarning, getCachedClaudeDesktopPolicy } = await import("../../claude/desktop-policy");
+      const policyState = deps.probeClaudeDesktopPolicy
+        ? await deps.probeClaudeDesktopPolicy({ platform: deps.platform ?? process.platform })
+        : await getCachedClaudeDesktopPolicy({ platform: deps.platform ?? process.platform });
+      const policyWarning = claudeDesktopPolicyWarning(policyState);
+      const warning = [modeWarning, policyWarning].filter(Boolean).join(" ");
       return jsonResponse({
         ok: true,
-        saved: true,
+        mode: "gateway",
+        saved: committed.ok,
         applied: true,
         path: result.path,
         fingerprint: result.fingerprint,
         policyState,
-        ...(policyWarning ? { warning: policyWarning } : {}),
+        ...(warning ? { warning } : {}),
       });
     } catch (error) {
       rethrowManagementBodyTooLarge(error);
@@ -1131,21 +1238,43 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
     try {
       const { claudeDesktopIntegrationEnabled } = await import("../../codex/desired-state");
       const { inspectDesktop3pConfigLibrary } = await import("../../claude/desktop-3p");
+      const { resolveClaudeDesktopApplyMode, inspectDesktopFirstParty } = await import("../../claude/desktop-first-party");
+      const { getClaudeInterceptState } = await import("../../claude/intercept/runtime");
+      const { DESKTOP_PICKER_ID_SUGGESTIONS, readInterceptBindings } = await import("../../claude/intercept/model-bindings");
       const persisted = loadConfig();
       const savedFingerprint = persisted.claudeCode?.desktopProfile?.appliedFingerprint ?? null;
       const observed = inspectDesktop3pConfigLibrary({ appliedFingerprint: savedFingerprint });
       const desiredEnabled = claudeDesktopIntegrationEnabled(persisted);
-      const applied = observed.kind === "gateway_ours" || observed.kind === "gateway_drifted";
+      const gatewayApplied = observed.kind === "gateway_ours" || observed.kind === "gateway_drifted";
+      // A gateway profile on disk is what Desktop actually runs, whatever the saved mode says.
+      const mode = gatewayApplied ? "gateway" : resolveClaudeDesktopApplyMode(persisted);
+      const firstPartySeen = inspectDesktopFirstParty(persisted);
+      const intercept = getClaudeInterceptState();
+      const firstParty = {
+        settingsState: firstPartySeen.settings.kind,
+        applied: firstPartySeen.applied,
+        stale: firstPartySeen.stale,
+        interceptEnabled: firstPartySeen.interceptEnabled,
+        interceptRunning: intercept !== null,
+        proxyPort: intercept?.proxyPort ?? firstPartySeen.proxyPort,
+        caCertPath: firstPartySeen.caCertPath,
+        // What the running proxy routes with right now (live config), not the file on disk.
+        modelBindings: readInterceptBindings(config.claudeCode),
+        pickerSuggestions: [...DESKTOP_PICKER_ID_SUGGESTIONS],
+      };
+      const applied = mode === "first-party" ? firstPartySeen.applied : gatewayApplied;
       // "Needs update" is only meaningful while the integration is wanted. When the
       // durable switch is OFF, a leftover drifted profile is residue to clear — not
       // a stale apply the operator should refresh.
-      const stale = desiredEnabled && observed.kind === "gateway_drifted";
+      const stale = desiredEnabled && (mode === "first-party" ? firstPartySeen.stale : observed.kind === "gateway_drifted");
       const { getDesktopHealth } = await import("../../claude/desktop-health");
-      const { claudeDesktopPolicyHealth, probeClaudeDesktopPolicy } = await import("../../claude/desktop-policy");
-      const policyState = (deps.probeClaudeDesktopPolicy ?? probeClaudeDesktopPolicy)({
-        platform: deps.platform ?? process.platform,
-      });
-      const policy = claudeDesktopPolicyHealth(policyState);
+      const { claudeDesktopPolicyHealth, getCachedClaudeDesktopPolicy } = await import("../../claude/desktop-policy");
+      const policyState = deps.probeClaudeDesktopPolicy
+        ? await deps.probeClaudeDesktopPolicy({ platform: deps.platform ?? process.platform })
+        : await getCachedClaudeDesktopPolicy({ platform: deps.platform ?? process.platform });
+      // Managed-policy conflicts only matter for the gateway profile; first-party mode never
+      // touches Desktop's own configuration.
+      const policy = claudeDesktopPolicyHealth(mode === "first-party" ? "absent" : policyState);
       const health = {
         ...getDesktopHealth(),
         ok: policy.ok,
@@ -1153,14 +1282,19 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
         policy,
       };
       const policyConflict = desiredEnabled && !policy.ok;
-      const baseDrift = desiredEnabled ? !applied || stale : applied || observed.kind === "unsafe";
+      const firstPartyResidue = mode === "gateway" && (firstPartySeen.applied || firstPartySeen.stale);
+      const baseDrift = desiredEnabled
+        ? !applied || stale || firstPartyResidue
+        : applied || gatewayApplied || firstPartySeen.applied || firstPartySeen.stale || observed.kind === "unsafe";
       const driftReason = policyConflict
         ? policy.state === "present" ? "managed_policy_present" : "managed_policy_unknown"
         : desiredEnabled
-          ? !applied ? "desired_on_not_current" : stale ? "profile_drift" : null
-          : applied ? "desired_off_gateway_selected" : null;
+          ? !applied ? "desired_on_not_current" : stale ? "profile_drift" : firstPartyResidue ? "first_party_residue" : null
+          : gatewayApplied ? "desired_off_gateway_selected" : firstPartySeen.applied || firstPartySeen.stale ? "desired_off_first_party_env" : null;
       return jsonResponse({
         desiredEnabled,
+        mode,
+        firstParty,
         installed: observed.kind !== "not_installed",
         observedKind: observed.kind,
         applied,
@@ -1177,6 +1311,53 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
         driftReason,
         health,
       });
+    } catch (error) {
+      return jsonResponse({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+  }
+
+  // First-party model bindings: Claude Desktop Code tab picker id -> opencodex route, honoured
+  // only on the claude-intercept ingress (src/claude/intercept/model-bindings.ts).
+  if (url.pathname === "/api/claude-desktop/first-party-bindings" && req.method === "PUT") {
+    let body: unknown;
+    try { body = await readManagementJsonBody(req); } catch (error) { rethrowManagementBodyTooLarge(error); return jsonResponse({ error: "invalid JSON body" }, 400); }
+    try {
+      const { applyInterceptBindingPatch, parseInterceptBindingPatch, readInterceptBindings } = await import("../../claude/intercept/model-bindings");
+      const patch = parseInterceptBindingPatch(body);
+      if ("error" in patch) return jsonResponse({ error: patch.error }, 400);
+      // Same route vocabulary the Desktop profile and the dashboard use, native routes included.
+      const state = await buildClaudeDesktopState(config);
+      const availableRoutes = new Set(state.models.filter(model => model.available).map(model => model.route));
+      let rejection: string | null = null;
+      const outcome = mutatePersistedConfig<OcxConfig["claudeCode"]>(persisted => {
+        const current = readInterceptBindings(persisted.claudeCode);
+        const next = applyInterceptBindingPatch(current, patch, availableRoutes);
+        if (!next.ok) {
+          rejection = next.error;
+          return { changed: false, value: persisted.claudeCode };
+        }
+        if (!next.changed) return { changed: false, value: structuredClone(persisted.claudeCode) };
+        const claudeCode = { ...(persisted.claudeCode ?? {}) };
+        const intercept = { ...(claudeCode.intercept ?? {}) };
+        if (Object.keys(next.bindings).length > 0) intercept.modelMap = next.bindings;
+        else delete intercept.modelMap;
+        if (Object.keys(intercept).length > 0) claudeCode.intercept = intercept;
+        else delete claudeCode.intercept;
+        persisted.claudeCode = claudeCode;
+        return { changed: true, value: structuredClone(persisted.claudeCode) };
+      });
+      if (rejection) return jsonResponse({ error: rejection }, 400);
+      if (outcome.status === "unavailable") {
+        return jsonResponse({ error: `First-party bindings could not be saved (config ${outcome.reason})` }, outcome.reason === "conflict" ? 409 : 500);
+      }
+      adoptPersistedClaudeCode(config, outcome.value);
+      // Pin the committed leaf: an unarmed live snapshot may otherwise keep its old intercept block.
+      const committedIntercept = outcome.value?.intercept;
+      const liveClaudeCode = { ...(config.claudeCode ?? {}) };
+      if (committedIntercept) liveClaudeCode.intercept = structuredClone(committedIntercept);
+      else delete liveClaudeCode.intercept;
+      config.claudeCode = liveClaudeCode;
+      return jsonResponse({ ok: true, modelBindings: readInterceptBindings(config.claudeCode) });
     } catch (error) {
       return jsonResponse({ error: error instanceof Error ? error.message : String(error) }, 400);
     }
@@ -1536,8 +1717,12 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
     const warnings: string[] = [];
     // authMode changes must reconcile the injected system env too: switching back to
     // Subscription has to remove the opencodex-owned dummy ANTHROPIC_AUTH_TOKEN
-    // (audit R1 blocker #1/#2, devlog 260720_claude_authmode_persist).
-    if (body.systemEnv !== undefined || body.authMode !== undefined) {
+    // (audit R1 blocker #1/#2, devlog 260720_claude_authmode_persist). Model slots and
+    // levers feed the same injection, so a changed or cleared slot must not linger in
+    // launchd until the next restart.
+    const systemEnvInputs = ["systemEnv", "authMode", "model", "smallFastModel", "tierModels",
+      "maxContextTokens", "alwaysEnableEffort", "autoContext", "autoCompactWindow"] as const;
+    if (systemEnvInputs.some(field => body[field] !== undefined)) {
       try {
         await applySystemEnvToggle(config, config.port);
       } catch (err) {

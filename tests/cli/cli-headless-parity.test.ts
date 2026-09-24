@@ -30,6 +30,9 @@ describe("ocx system codex-restart confirmation", () => {
       const warning = errors.mock.calls.flat().join(" ");
       expect(warning).toContain("requires --yes");
       expect(warning).toContain("fully quits and relaunches the Codex desktop app");
+      expect(warning).toContain("unsaved composer drafts");
+      expect(warning).toContain("model-picker selections");
+      expect(warning).toContain("pending approval prompts");
     } finally { errors.mockRestore(); }
   });
 
@@ -48,6 +51,9 @@ describe("ocx system codex-restart confirmation", () => {
       else {
         expect(text).toContain("Codex desktop app");
         expect(text).toContain("restart requested.");
+        expect(text).toContain("Unsaved composer drafts");
+        expect(text).toContain("model-picker selections");
+        expect(text).toContain("pending approval prompts");
         expect(text).not.toContain("restarted");
       }
     } finally { output.mockRestore(); }
@@ -404,6 +410,7 @@ describe("headless GUI parity CLI", () => {
       ["/api/logs", "ocx observe"],
       ["/api/lab", "ocx lab"],
       ["/api/config", "ocx config"],
+      ["/api/companion", "ocx companion"],
       // The client machine plane. These are served by the connected client's own loopback
       // listener rather than the hub, and each one mirrors a connect-family command:
       // status/clients -> `ocx connect status`, sync -> `ocx sync`, shim -> the client
@@ -415,6 +422,9 @@ describe("headless GUI parity CLI", () => {
       // inventory and writes one config key. There is no headless equivalent
       // today, and claiming one would be worse than saying so here.
       ["/api/codex-prompt", "(none — GUI prompt-layer surface; keys live in config.toml)"],
+      // Claude reset grants: reading is an owed CLI verb (deferred-verb in the route
+      // registry) and spending is dashboard-session-only by design.
+      ["/api/anthropic/reset-grants", "(none — GUI reset-grant dialog; spend requires a dashboard session)"],
       ["/api/settings", "ocx system"],
       // Routing Intelligence (RI-04..RI-10): profiles + dry-run are mirrored by
       // `ocx route policy`. Analytics is GUI-first for now; the same request

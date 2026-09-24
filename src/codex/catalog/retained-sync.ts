@@ -15,9 +15,9 @@ import {
   availableAccountGatedNativeModels,
   codexModelEntitlementStateForAccount,
   isCodexModelEntitlementSnapshotCurrent,
-  resolveCodexModelEntitlements,
   type CodexModelEntitlementSnapshot,
 } from "../model-entitlements";
+import { resolveAdmittedCodexModelEntitlements } from "../model-entitlement-admission";
 import { isAccountNeedsReauth } from "../account-runtime-state";
 import { codexRuntimeStatePath } from "../runtime";
 import {
@@ -59,10 +59,12 @@ import {
   type CatalogWritePermit,
 } from "../catalog-write-serialization";
 import {
+  preparedBytesDifferFromDisk,
   publishHashedCodexCatalogBackup,
   publishLegacyCodexCatalogBackup,
   replaceActiveCodexCatalog,
   replaceCodexModelsCache,
+  type PreparedCatalogFileWrite,
 } from "../internal/catalog-writer";
 import { visibleCodexAccountSelectors } from "./account-models";
 import { ACCOUNT_GATED_NATIVE_OPENAI_MODELS, NATIVE_OPENAI_MODELS, NATIVE_RESERVE_MODEL } from "./native-models";
@@ -232,24 +234,6 @@ function revalidateRetainedCatalogSync(
     evidence,
     processEvidence: prepared.processEvidence,
   };
-}
-
-/**
- * Exact bytes currently on disk at `path`, or null when unreadable/absent.
- *
- * Deliberately a Buffer rather than a decoded string: `readFileSync(path, "utf8")`
- * substitutes U+FFFD for every invalid byte, so a file holding a raw 0x80 decodes
- * equal to prepared content holding a legitimately encoded U+FFFD. Comparing the
- * decoded strings would then classify a malformed catalog as identical, skip the
- * atomic repair write, and leave the corruption on disk while reporting
- * `catalogWritten: false`.
- */
-function currentCatalogFileContent(path: string): Buffer | null {
-  try {
-    return readFileSync(path);
-  } catch {
-    return null;
-  }
 }
 
 function pristineCatalogBytes(read: RetainedCatalogSyncRead): string | null {
@@ -558,15 +542,12 @@ function writeRetainedCatalogSync({
   // nothing about the catalog changed. Skipping the no-op write keeps both the mtime
   // and `catalogWritten` honest; `added` still reports the routed rows the catalog
   // carries, because they are on disk either way.
-  const onDiskBytes = currentCatalogFileContent(catalogPath);
-  if (onDiskBytes !== null && onDiskBytes.equals(Buffer.from(content, "utf8"))) {
+  const preparedCatalog: PreparedCatalogFileWrite = { path: catalogPath, content };
+  if (!preparedBytesDifferFromDisk(preparedCatalog)) {
     return { added, path: catalogPath, catalogWritten: false, comboOmissions };
   }
 
-  replaceActiveCodexCatalog(permit, owningCodexHome, {
-    path: catalogPath,
-    content,
-  });
+  replaceActiveCodexCatalog(permit, owningCodexHome, preparedCatalog);
   return {
     added,
     path: catalogPath,
@@ -620,7 +601,7 @@ export async function syncCatalogModels(
       comboOmissions,
       providerModelOutcomes,
     }),
-    resolveCodexModelEntitlements(config),
+    resolveAdmittedCodexModelEntitlements(config),
   ]);
   const committed = withCatalogWriteSerialization(owningCodexHome, permit => {
     // Desired state can flip OFF during the provider await above. The catalog
@@ -668,11 +649,13 @@ export async function syncCatalogModels(
   };
 }
 
-export function invalidateCodexModelsCacheWithPermit(
+export type CodexCacheInvalidationOutcome = "written" | "unchanged" | "missing_catalog" | "desired_disabled" | "failed";
+
+export function invalidateCodexModelsCacheWithPermitOutcome(
   permit: CatalogWritePermit,
   owningCodexHome: string,
   options?: CodexCatalogSyncOptions,
-): boolean {
+): CodexCacheInvalidationOutcome {
   try {
     // This permit is a REACQUISITION: refreshCodexModelCatalog's commit released
     // K before this rewrite runs, so the commit-path desired-state check cannot
@@ -680,9 +663,9 @@ export function invalidateCodexModelsCacheWithPermit(
     // routed cache write — re-read intent under this permit, same as the commit.
     // The catalog-only sync override applies here too so an explicit refresh
     // keeps the cache consistent with the catalog it just wrote.
-    if (!shouldSyncCodexOnStart(loadConfig()) && options?.allowWhenDesiredDisabled !== true) return false;
+    if (!shouldSyncCodexOnStart(loadConfig()) && options?.allowWhenDesiredDisabled !== true) return "desired_disabled";
     const catalogPath = readCodexCatalogPathForHome(owningCodexHome);
-    if (!existsSync(catalogPath)) return false;
+    if (!existsSync(catalogPath)) return "missing_catalog";
     const catalog = JSON.parse(readFileSync(catalogPath, "utf8"));
     const models = catalog.models ?? catalog;
     const cachePath = join(owningCodexHome, "models_cache.json");
@@ -713,14 +696,37 @@ export function invalidateCodexModelsCacheWithPermit(
       client_version: "0.0.0",
       models: [...models, ...observedAccountModels],
     };
-    replaceCodexModelsCache(permit, owningCodexHome, {
+    const preparedCache: PreparedCatalogFileWrite = {
       path: cachePath,
       content: `${JSON.stringify(wrapper, null, 2)}\n`,
-    });
-    return true;
+    };
+    // The same no-op rule the active catalog already applies (#1459), for the same
+    // reason and at the second writer that has to obey it.
+    //
+    // This function is what `refreshCodexModelCatalog` reports as `cacheSynced`, and
+    // `handleStart` ORs that into the stale-app-server warning. Rewriting identical
+    // bytes bumped this file's mtime and returned `true`, so on a start where the
+    // catalog reproduced byte-identically — the settled case — the warning still
+    // claimed "Disk catalog/cache were updated" and told the operator their Codex
+    // model list might be stale, when nothing on disk had changed and Codex held the
+    // same model set the file already described. Returning `false` here makes
+    // `cacheSynced` mean what its name and its consumers already assume, and what
+    // `pullRemoteCatalog` and the early returns in `refreshCodexModelCatalog`
+    // already assert: a write happened.
+    if (!preparedBytesDifferFromDisk(preparedCache)) return "unchanged";
+    replaceCodexModelsCache(permit, owningCodexHome, preparedCache);
+    return "written";
   } catch {
-    return false;
+    return "failed";
   }
+}
+
+export function invalidateCodexModelsCacheWithPermit(
+  permit: CatalogWritePermit,
+  owningCodexHome: string,
+  options?: CodexCatalogSyncOptions,
+): boolean {
+  return invalidateCodexModelsCacheWithPermitOutcome(permit, owningCodexHome, options) === "written";
 }
 
 export function invalidateCodexModelsCache(options?: CodexCatalogSyncOptions): boolean {

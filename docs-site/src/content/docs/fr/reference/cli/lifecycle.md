@@ -15,7 +15,7 @@ Assistant de configuration interactif (`setup` est un alias de `init`). Il deman
 
 ### `ocx start [--port <port>] [--socks5 [host:port] | --socks5-off]`
 
-Démarre le serveur proxy, de préférence sur le port `10100`. La commande écrit l’état du PID et du port d’exécution, et refuse de démarrer une deuxième instance active. Lorsque le port préféré est occupé, `start` interroge le processus qui l’occupe puis s’arrête dans tous les cas : elle refuse de démarrer si un processus opencodex y répond et signale sinon que le processus est inconnu. Elle ne déplace jamais l’écouteur vers un autre port d’elle-même, car cela laisserait le premier proxy en cours d’exécution et redirigerait Codex vers le second. Indiquez un autre port avec `--port`, ou définissez `port: 0` dans la configuration pour demander au système d’exploitation d’en attribuer un. Au démarrage, elle synchronise dans le catalogue Codex les modèles de chaque fournisseur. À l’arrêt, elle rétablit le fonctionnement natif de Codex, sauf si le proxy a été lancé comme service géré (`OCX_SERVICE=1`).
+Démarre le serveur proxy, de préférence sur le port `10100`. La commande écrit l’état du PID et du port d’exécution, et refuse de démarrer une deuxième instance active. Lorsque le port préféré est occupé, `start` interroge le processus qui l’occupe puis s’arrête dans tous les cas : elle refuse de démarrer si un processus opencodex y répond et signale sinon que le processus est inconnu. Elle ne déplace jamais l’écouteur vers un autre port d’elle-même, car cela laisserait le premier proxy en cours d’exécution et redirigerait Codex vers le second. Un autre `--port` explicite est également refusé avec le même `OPENCODEX_HOME`, car les modes d’observation et de plafond écrivent tous deux dans le même journal de dépenses. Utilisez un `OPENCODEX_HOME` distinct pour une instance sœur indépendante ; `port: 0` ne sépare que l’attribution du port, pas l’état. Au démarrage, elle synchronise dans le catalogue Codex les modèles de chaque fournisseur. À l’arrêt, elle rétablit le fonctionnement natif de Codex, sauf si le proxy a été lancé comme service géré (`OCX_SERVICE=1`).
 
 `--socks5` (par défaut `127.0.0.1:10808`) enregistre l’URL SOCKS5 dans `config.proxy` et achemine
 les requêtes HTTP(S) sortantes dans un véritable tunnel SOCKS5. `--socks5-off` supprime uniquement
@@ -303,6 +303,7 @@ Utilisez `ocx service` pour maintenir un proxy d’arrière-plan toujours actif,
 ### `ocx tray <install|start|stop|status|uninstall|remove> [--json] [--no-start]`
 
 Installe et contrôle l’icône OpenCodex dans la zone de notification Windows. Elle démarre à l’ouverture de session et fournit des commandes du proxy accessibles en un clic. `start` et `stop` contrôlent uniquement l’icône ; utilisez son menu pour contrôler le proxy. `--no-start` s’applique à `install` et installe l’icône sans la lancer immédiatement.
+Obsolète : l’application OpenCodex fournit la zone de notification sous Windows, macOS et Linux ; `ocx tray` reste disponible pour les installations sans l’application de bureau.
 
 ## Tableau de bord
 
@@ -315,6 +316,8 @@ Ouvre le [tableau de bord Web](/fr/guides/web-dashboard/) à l’adresse `http:/
 `ocx update` met à jour OpenCodex lui-même, et non la CLI Codex. Utilisez `ocx system codex-cli-update check` parmi les [commandes d’inspection système](/fr/reference/cli/agents/) pour vérifier, de façon bornée et en lecture seule, la provenance du candidat Codex CLI configuré. Cette commande n’interroge aucun registre de paquets et n’installe aucune mise à jour.
 
 ### `ocx update [--tag latest|preview]`
+
+Lorsque OpenCodex est installé avec mise, cette commande échoue avant d'arrêter le proxy ou de modifier les fichiers du paquet et affiche `mise upgrade <outil>` avec l'alias mise local vérifié. La vérification des mises à jour reste disponible et signale une gestion externe. Des métadonnées de propriété mise illisibles ou incohérentes bloquent aussi toute modification sans deviner le nom de l'outil, et `--tag preview` ne change jamais la sélection configurée dans mise.
 
 Met à jour opencodex depuis npm. Les installations stables utilisent `@latest` ; les préversions restent sur `@preview`, sauf si vous indiquez `--tag latest|preview`. La commande détecte un dépôt de sources et vous invite alors à exécuter `git pull && bun install`. Elle ne fait rien si la version la plus récente correspondant à cette balise est déjà installée.
 

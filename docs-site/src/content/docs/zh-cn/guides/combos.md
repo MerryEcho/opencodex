@@ -152,6 +152,7 @@ combo 失败分为 **跳转** 失败和 **终止** 失败。
 | 被分类为认证、订阅、配额、速率限制、过载或上游服务器错误 | 即使仅凭状态码不足以判断，也会使该目标进入冷却并跳转。 |
 | 客户端取消（499）、`origin_rejected`、cyber-policy 拒绝、上下文溢出，或其他无效请求 | 停止并返回错误；换其他目标也无法让请求变得有效。 |
 | 结构化 HTTP 400，明确拒绝 `user`、对 `reasoning.effort`/`reasoning_effort` 返回不支持值，或返回模型特定图像输入拒绝（`param: input`） | 在输出开始前跳转到下一个符合条件的目标，且不记录冷却时间；参见下方可选参数兼容性。 |
+| 由进程内适配器（`runTurn`）执行的 Responses 回合中，当前请求未声明的第一个工具调用（在任何输出和不可重放的副作用之前） | 让该目标进入冷却，并以相同的工具目录跳转到下一个目标。出现可见输出或不可重放的副作用之后，拒绝即为最终结果。Chat Completions 和 Anthropic Messages 请求不受影响。 |
 | 任何其他未分类错误 | 停止并返回错误。 |
 
 未设置 `cooldownMs` 时，发生跳转的目标使用上游回退值：对于上游代码为 `1302` 或 `1305` 的请求速率限制 429，等待 5 秒；其他情况等待 60 秒。设置后，只要不存在可用的上游 `Retry-After` 或 Codex 重置信号，就会应用 `cooldownMs`，包括这些请求速率限制 429。接受数字形式的 `Retry-After` 秒数和 HTTP-date 值，每次冷却最多封顶 10 分钟。优先级从强到弱依次为：显式 `Retry-After` → Codex 重置标头（`x-codex-primary-reset-at`、`x-codex-secondary-reset-at` 或 `x-codex-tertiary-reset-at`）→ combo 的 `cooldownMs`（已设置时）→ 上游速率限制代码 `1302`/`1305` 的 5 秒请求速率限制回退值 → 60 秒默认值。有效的即时指令 `Retry-After: 0` 会保留为上游即时指令，不会被配置的冷却替换。
@@ -160,6 +161,7 @@ combo 失败分为 **跳转** 失败和 **终止** 失败。
 
 :::note
 故障切换是有边界的。它有助于处理特定目标的可用性、认证、配额和过载失败；它不会掩盖调用方错误或策略拒绝。
+在非 combo 的 Responses 请求上，allowlist 中的 xAI 策略 403 会在 Codex 将其当作传输失败重试之前被改写为 HTTP 200 `incomplete/content_filter`；见 [xAI policy refusals](/reference/proxy-formats/#xai-policy-refusals)。combo 跳转仍把原始 HTTP 403 分类为跳转。
 :::
 
 对于流式请求，上游 HTTP 状态并不是最终决定。OpenCodex 只会缓冲所选子目标在开始输出前的一段有上限的 Responses SSE。若在任何文本、推理、工具调用或其他输出事件开始之前收到可重试的 `response.failed` 终止事件，该次尝试会被记为失败，combo 可以继续尝试下一个合格目标。一旦输出开始或预输出缓冲区达到上限，当前目标就会被提交；之后的流错误不会在其他提供商上重放，从而避免重复文本和重复执行工具。

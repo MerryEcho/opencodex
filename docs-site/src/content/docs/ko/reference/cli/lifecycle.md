@@ -22,8 +22,10 @@ Codex 자동 시작 shim도 설치합니다.
 인스턴스는 시작하지 않습니다. 권장 포트가 이미 사용 중이면 `start`가 점유자를 확인한 뒤 어느 경우든
 실행을 멈춥니다. opencodex가 응답하면 시작을 거부하고, 그렇지 않으면 점유자를 식별할 수 없다고
 알립니다. 첫 번째 프록시를 실행한 채 Codex가 두 번째 프록시를 가리키게 되므로, 리스너를 다른 포트로
-자동 이동하지 않습니다. 다른 포트는 `--port`로 지정하거나, OS에 포트 할당을 요청하려면 구성에서
-`port: 0`을 설정하세요. 시작할 때는 각 공급자의 모델을 Codex 카탈로그로 동기화합니다. 종료할 때는
+자동 이동하지 않습니다. 활성 프록시와 같은 `OPENCODEX_HOME`을 사용하면 다른 `--port`를 명시해도
+시작을 거부합니다. 관찰 전용과 제한 적용 모드 모두 같은 지출 저널에 기록하기 때문입니다. 독립된 형제
+인스턴스에는 별도의 `OPENCODEX_HOME`을 사용하세요. `port: 0`은 포트만 OS에 맡기며 상태를 분리하지
+않습니다. 시작할 때는 각 공급자의 모델을 Codex 카탈로그로 동기화합니다. 종료할 때는
 기본 Codex를 복원합니다. 단, 관리형 서비스로 실행한 경우(`OCX_SERVICE=1`)는 예외입니다.
 
 `--socks5`(기본값 `127.0.0.1:10808`)는 SOCKS5 URL을 `config.proxy`에 저장하고 실제 SOCKS5
@@ -388,6 +390,8 @@ OpenCodex를 업데이트한 뒤 기존 Windows shim에 이 동작을 적용하�
 Windows 상태 트레이 아이콘을 설치하고 제어합니다. Windows 로그인 시 시작되며, 프록시를 원클릭으로
 제어할 수 있습니다. `start`와 `stop`은 아이콘만 제어합니다. 프록시 제어는 메뉴를 사용하세요.
 `--no-start`는 `install`에 적용되며, 트레이를 바로 실행하지 않고 설치합니다.
+지원 중단 예정: OpenCodex 데스크톱 앱이 Windows, macOS, Linux에서 트레이를 제공합니다.
+`ocx tray`는 데스크톱 앱이 없는 설치를 위해 계속 사용할 수 있습니다.
 
 ## 대시보드
 
@@ -401,6 +405,8 @@ Windows 상태 트레이 아이콘을 설치하고 제어합니다. Windows 로�
 `ocx update`는 OpenCodex 자체를 업데이트하며 Codex CLI를 업데이트하지 않습니다. [system 검사 명령](/ko/reference/cli/agents/)의 `ocx system codex-cli-update check`로 설정된 Codex CLI 후보의 provenance를 제한된 읽기 전용 방식으로 확인할 수 있습니다. 이 명령은 package registry를 조회하거나 업데이트를 설치하지 않습니다.
 
 ### `ocx update [--tag latest|preview]`
+
+OpenCodex가 mise를 통해 설치된 경우 이 명령은 프록시를 중지하거나 패키지 파일을 변경하기 전에 실패하며 검증된 로컬 mise 별칭을 사용한 `mise upgrade <tool>`을 표시합니다. 업데이트 확인은 계속 사용할 수 있고 외부 관리 설치로 보고합니다. mise 소유권 메타데이터를 읽을 수 없거나 일관되지 않아도 도구 이름을 추측하지 않고 변경을 거부하며, `--tag preview`는 mise에 구성된 선택을 변경하지 않습니다.
 
 npm에서 opencodex를 자체 업데이트합니다. 안정판 설치는 `@latest`를 사용하고, 미리보기 설치는
 `--tag latest|preview`를 주지 않으면 `@preview`를 유지합니다. 소스 체크아웃을 감지하면 대신

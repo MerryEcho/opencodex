@@ -275,6 +275,14 @@ export async function handleComboRoutes(ctx: ManagementContext): Promise<Respons
             Object.entries(claudeCode.modelMap).map(([source, model]) => [source, migrateAgentReference(model)]),
           );
         }
+        if (claudeCode.intercept?.modelMap) {
+          claudeCode.intercept = {
+            ...claudeCode.intercept,
+            modelMap: Object.fromEntries(
+              Object.entries(claudeCode.intercept.modelMap).map(([pickerId, route]) => [pickerId, migrateAgentReference(route)]),
+            ),
+          };
+        }
         config.claudeCode = claudeCode;
       }
     }

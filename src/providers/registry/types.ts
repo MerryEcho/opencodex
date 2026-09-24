@@ -264,6 +264,8 @@ export interface ProviderRegistryEntry {
   modelServiceTierCapabilityBaseUrlGuard?: (baseUrl: string) => boolean;
   /** Registry default for plaintext reasoning replay; see `OcxProviderConfig.preserveResponsesReasoningContent`. Registry-only like `supportsServiceTier`. */
   preserveResponsesReasoningContent?: boolean;
+  /** Registry default for dropping replayed reasoning items for Responses upstreams that reject them. */
+  dropResponsesReasoningItems?: boolean;
   /** Registry defaults for per-model Codex reasoning propagation; explicit user keys win during enrichment. */
   modelSupportsReasoningSummaries?: Record<string, boolean>;
   /** Registry defaults for per-model Codex Responses verbosity support. */
@@ -306,6 +308,7 @@ export interface ProviderRegistryEntry {
   noReasoningModels?: string[];
   noTemperatureModels?: string[];
   noTopPModels?: string[];
+  noStopModels?: string[];
   noPenaltyModels?: string[];
   /**
    * Registry-only seed for `OcxProviderConfig.noJsonSchemaModels`. Merged into the
@@ -333,6 +336,8 @@ export interface ProviderRegistryEntry {
    */
   showThinkingSummary?: boolean;
   reasoningSplitModels?: string[];
+  /** See OcxProviderConfig.inlineThinkTagModels. */
+  inlineThinkTagModels?: string[];
   reasoningDetailsModels?: string[];
   thinkingToggleModels?: string[];
   thinkingBudgetModels?: string[];
@@ -355,7 +360,7 @@ export type ProviderConfigSeed = Pick<
   | "modelDisplayNames"
   | "modelMaxInputTokens" | "defaultMaxOutputTokens" | "modelMaxOutputTokens"
   | "reasoningEfforts" | "modelReasoningEfforts" | "modelDefaultReasoningEfforts" | "reasoningEffortMap" | "modelReasoningEffortMap" | "reasoningWireFormat"
-  | "noVisionModels" | "noReasoningModels" | "noTemperatureModels" | "noTopPModels" | "noPenaltyModels"
-  | "autoToolChoiceOnlyModels" | "preserveReasoningContentModels" | "requiresReasoningPlaceholderModels" | "reasoningSplitModels" | "reasoningDetailsModels" | "thinkingToggleModels" | "thinkingBudgetModels" | "escapeBuiltinToolNames" | "openaiChatEofTolerance" | "showThinkingSummary"
+  | "noVisionModels" | "noReasoningModels" | "noTemperatureModels" | "noTopPModels" | "noStopModels" | "noPenaltyModels"
+  | "autoToolChoiceOnlyModels" | "preserveReasoningContentModels" | "requiresReasoningPlaceholderModels" | "reasoningSplitModels" | "inlineThinkTagModels" | "reasoningDetailsModels" | "thinkingToggleModels" | "thinkingBudgetModels" | "escapeBuiltinToolNames" | "openaiChatEofTolerance" | "showThinkingSummary"
   | "googleMode" | "project" | "location" | "headers"
 >;

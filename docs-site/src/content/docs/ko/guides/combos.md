@@ -132,6 +132,7 @@ ocx combo set balanced \
 | 인증, 구독, 쿼터, 속도 제한, 과부하, 또는 상위 서버 오류로 분류됨 | 상태 코드만으로는 충분하지 않더라도 대상을 쿨다운으로 보내고 넘어갑니다. |
 | 클라이언트 취소(499), `origin_rejected`, cyber-policy refusal, context overflow, 또는 기타 invalid request | 멈추고 오류를 반환합니다. 다른 대상을 써도 요청이 유효해지지 않기 때문입니다. |
 | `user`를 명시적으로 거부하거나, `reasoning.effort`/`reasoning_effort`의 지원되지 않는 값 또는 모델별 이미지 입력 거부(`param: input`)를 나타내는 구조화된 HTTP 400 | 출력 시작 전에 쿨다운 기록 없이 다음 적격 대상으로 넘어갑니다. 선택적 매개변수 호환성을 참조하세요. |
+| 인프로세스 어댑터(`runTurn`)가 실행하는 Responses 턴에서 현재 요청이 선언하지 않은 첫 도구 호출(출력이나 재전송 불가 부작용 이전) | 대상을 쿨다운하고 같은 도구 카탈로그로 다음 대상으로 넘어갑니다. 출력이 보였거나 재전송 불가 부작용이 생긴 뒤에는 거부가 그대로 확정됩니다. Chat Completions와 Anthropic Messages 요청은 바뀌지 않습니다. |
 | 그 밖의 분류되지 않은 오류 | 멈추고 오류를 반환합니다. |
 
 `cooldownMs`가 설정되지 않으면 홉된 대상은 업스트림 폴백을 사용합니다. 업스트림 코드 `1302` 또는 `1305`인 요청 속도 제한 429는 5초, 그 외에는 60초입니다. 설정하면 사용 가능한 업스트림 `Retry-After` 또는 Codex 재설정 신호가 없을 때, 해당 요청 속도 제한 429를 포함해 `cooldownMs`가 적용됩니다. 숫자로 된 `Retry-After` 초와 HTTP-date 값을 허용하며, 모든 쿨다운은 최대 10분으로 제한됩니다. 우선순위는 강한 순서대로 명시적 `Retry-After` → Codex 재설정 헤더(`x-codex-primary-reset-at`, `x-codex-secondary-reset-at`, 또는 `x-codex-tertiary-reset-at`) → 콤보의 `cooldownMs`(설정된 경우) → 업스트림 속도 제한 코드 `1302`/`1305`의 5초 요청 속도 제한 폴백 → 60초 기본값입니다. 유효한 즉시 지시인 `Retry-After: 0`은 설정된 쿨다운으로 대체하지 않고 업스트림의 즉시 지시로 유지합니다.
@@ -140,6 +141,7 @@ ocx combo set balanced \
 
 :::note
 페일오버는 의도적으로 범위를 제한합니다. 대상별 가용성, 인증, 쿼터, 과부하 실패에는 도움이 되지만, 호출자 오류나 정책 거부를 숨기지는 않습니다.
+콤보가 아닌 Responses 요청에서는 allowlist에 오른 xAI 정책 403이 Codex가 전송 실패로 재시도하기 전에 HTTP 200 `incomplete/content_filter`로 바뀝니다. [xAI policy refusals](/reference/proxy-formats/#xai-policy-refusals)를 보세요. 콤보 홉은 원래 HTTP 403을 홉으로 분류합니다.
 :::
 
 스트리밍 요청에서는 상위 HTTP 상태만으로 최종 결정을 내리지 않습니다. OpenCodex는 선택한 하위 대상의 Responses SSE를 출력 시작 전의 제한된 구간까지만 버퍼링합니다. 텍스트, 추론, 도구 호출 또는 그 밖의 출력 이벤트가 시작되기 전에 재시도 가능한 `response.failed` 종결 이벤트가 오면 해당 시도를 실패로 기록하고 다음 적합한 대상을 시도할 수 있습니다. 출력이 시작되거나 버퍼 상한에 도달하면 현재 대상에 커밋하며, 이후의 스트림 실패를 다른 공급자에서 다시 실행하지 않습니다. 따라서 텍스트와 도구 실행이 중복되지 않습니다.

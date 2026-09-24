@@ -25,11 +25,13 @@ import {
 } from "../model-cache";
 import {
   buildModelsRequest,
+  getOAuthCredentialApiBaseUrl,
   getValidAccessTokenSnapshot,
   observeActiveOAuthAccessToken,
   resolveModelsAuthToken,
   type OAuthActiveTokenObservation,
 } from "../../oauth";
+import { getAccountSet } from "../../oauth/store";
 import type { OcxConfig, OcxProviderConfig } from "../../types";
 import { modelInList } from "../../types";
 import { CODEX_REASONING_LEVELS, codexEffortRank, configuredReasoningEfforts, modelRecordValue, sanitizeCodexReasoningEfforts } from "../../reasoning-effort";
@@ -100,8 +102,9 @@ import type {
   CatalogSourceEvidence,
   CatalogTrustedOpenAiApiPolicySnapshot,
 } from "../convergence-types";
-import { applyRegistryCapabilitySeedFill, modelCapabilities, modelInputModalities } from "./model-hints";
+import { modelCapabilities, modelInputModalities } from "./model-hints";
 import { configuredComboTargetModelsByProvider } from "./combo-member";
+import { resolveModelPolicy } from "../../providers/resolved-model-policy";
 
 /** Concurrent gatherRoutedModels callers with the same catalog identity share one live discovery.
  *  Keyed by gatherFlightKey so a different config cannot join or evict the wrong flight. */
@@ -149,6 +152,12 @@ export interface CapturedProviderGather {
   readonly metadataModelIdCaseFold: boolean;
   readonly effectiveAlias?: string | null;
   readonly observedAuth?: ModelsAuthResolution;
+  /**
+   * The active OAuth account a refreshing capture was taken under. It is part of the
+   * flight's auth identity, so a caller on another account never joins a pending
+   * discovery started for this one, even when both accounts share an API host.
+   */
+  readonly refreshingOAuthAccountId?: string;
   /**
    * Configured model ids this provider must keep even when live discovery omits
    * them — combo targets that are also listed in providers.*.models (OCX-111).
@@ -314,14 +323,12 @@ export function captureTrustedOpenAiApiPolicy(
   });
 }
 
-function captureModelsRequest(
+export function captureModelsRequest(
   name: string,
   provider: OcxProviderConfig,
-  observedAuth: ModelsAuthResolution | undefined,
+  oauthApiBaseUrl: string | undefined,
 ): CapturedModelsRequest {
-  const observed = observedAuth
-    ? { oauthApiBaseUrl: observedAuth.oauthApiBaseUrl }
-    : undefined;
+  const observed = { oauthApiBaseUrl };
   const withoutCredential = buildModelsRequest(provider, undefined, name, observed);
   const withCredential = buildModelsRequest(provider, REQUEST_CREDENTIAL_SENTINEL, name, observed);
   const method = withoutCredential.method ?? "GET";
@@ -344,8 +351,26 @@ export function captureProviderGather(
 ): CapturedProviderGather {
   const enriched = detachedClone(withCanonicalOpenAiForwardAuthDefault(name, configured));
   enrichProviderFromRegistry(name, enriched);
-  applyRegistryCapabilitySeedFill(name, enriched);
   const registryTransportMatch = providerMatchesRegistryTransport(name, enriched);
+  const registryEntry = registryTransportMatch ? getProviderRegistryEntry(name) : undefined;
+  const staticProvider = resolveModelPolicy({
+    providerName: name,
+    modelId: enriched.defaultModel ?? "__catalog_capture__",
+    provider: enriched,
+    registryEntry,
+    transportMatchedRegistry: registryTransportMatch,
+    ...(enriched.authMode ? { effectiveAuth: { authMode: enriched.authMode } } : {}),
+  }).provider;
+  for (const key of [
+    "modelContextWindows", "modelInputModalities", "modelMaxInputTokens", "modelMaxOutputTokens",
+    "modelReasoningEfforts", "modelSupportsReasoningSummaries",
+    "modelSupportsVerbosity", "modelSupportsServiceTier",
+  ] as const) {
+    if (staticProvider[key] !== undefined) enriched[key] = detachedClone(staticProvider[key]) as never;
+  }
+  // A present modelDefaultReasoningEfforts object is a whole-map catalog authority, including
+  // explicit {}. enrichProviderFromRegistry already preserves/fills that contract; replacing it
+  // with the resolver's per-key registry fill would turn "no configured default" into a seed default.
   const provider = recursivelyFreeze(enriched);
   const fastPolicyAuthority = captureFastPolicyAuthority(
     name,
@@ -359,7 +384,18 @@ export function captureProviderGather(
     && provider.liveModels !== false
     ? authResolver.resolve(name, provider)
     : undefined;
-  const request = captureModelsRequest(name, provider, observedAuth);
+  // A refreshing capture carries the stored origin so accounts on different hosts keep separate
+  // flights. The send is rebuilt from the auth the gather resolves, and the observed path never
+  // reads the live store.
+  const oauthApiBaseUrl = observedAuth
+    ? observedAuth.oauthApiBaseUrl
+    : authResolver.kind === "refreshing" && provider.authMode === "oauth"
+      ? getOAuthCredentialApiBaseUrl(name)
+      : undefined;
+  const request = captureModelsRequest(name, provider, oauthApiBaseUrl);
+  const refreshingOAuthAccountId = !observedAuth && authResolver.kind === "refreshing" && provider.authMode === "oauth"
+    ? getAccountSet(name)?.activeAccountId
+    : undefined;
   const resolved = resolveProviderModelDiscovery(name, provider);
   const discovery = detachedFrozen({
     ...(resolved.spec ? { spec: resolved.spec } : {}),
@@ -394,6 +430,7 @@ export function captureProviderGather(
     metadataModelIdCaseFold,
     effectiveAlias,
     ...(observedAuth ? { observedAuth: Object.freeze({ ...observedAuth }) } : {}),
+    ...(refreshingOAuthAccountId ? { refreshingOAuthAccountId } : {}),
     ...(retainConfiguredModelIds && retainConfiguredModelIds.size > 0
       ? { retainConfiguredModelIds }
       : {}),
@@ -428,6 +465,7 @@ export function captureGatherFlight(
       liveModels: provider.provider.liveModels ?? null,
       credential: provider.provider.apiKey ?? null,
       observedAuth: provider.observedAuth ?? null,
+      oauthAccount: provider.refreshingOAuthAccountId ?? null,
       headers: provider.request.headersWithCredential,
       url: provider.request.url,
     }))),

@@ -26,9 +26,11 @@ durumunu yazar ve ikinci bir canlı örneği başlatmayı reddeder. Tercih edile
 doluysa `start`, portu tutan süreci sorgular ve her iki durumda da durur: orada bir
 opencodex yanıt veriyorsa başlatmayı reddeder, aksi halde portu tutan sürecin
 tanımlanamadığını bildirir. İlk proxy'yi çalışır durumda bırakıp Codex'i ikinciye
-yönlendireceği için dinleyiciyi kendiliğinden başka bir porta taşımaz. `--port` ile
-farklı bir port belirtin veya işletim sisteminden bir port istemek için yapılandırmada
-`port: 0` ayarlayın. Başlangıçta her sağlayıcının modellerini Codex'in kataloğuna
+yönlendireceği için dinleyiciyi kendiliğinden başka bir porta taşımaz. Aynı
+`OPENCODEX_HOME` kullanılırken farklı bir `--port` açıkça verilse de başlangıç reddedilir;
+yalnızca gözlem ve sınır uygulama kiplerinin ikisi de aynı harcama günlüğüne yazar. Bağımsız
+bir kardeş örnek için ayrı bir `OPENCODEX_HOME` kullanın. `port: 0` yalnızca port seçimini
+işletim sistemine bırakır, durumu ayırmaz. Başlangıçta her sağlayıcının modellerini Codex'in kataloğuna
 senkronize eder. Kapatıldığında — yönetilen bir servis olarak başlatılmadığı sürece
 (`OCX_SERVICE=1`) — yerel Codex'i geri yükler.
 
@@ -468,6 +470,8 @@ Windows durum tepsisi simgesini kurun ve kontrol edin. Windows oturum açılış
 başlar ve tek tıklamayla proxy kontrolleri sağlar. `start` ve `stop` yalnızca
 simgeyi kontrol eder; proxy'yi kontrol etmek için menüsünü kullanın.
 `--no-start`, `install` için geçerlidir ve tepsiyi hemen başlatmadan kurar.
+Kullanımdan kaldırıldı: OpenCodex masaüstü uygulaması Windows, macOS ve Linux'ta tepsi sağlar;
+`ocx tray`, masaüstü uygulaması olmayan kurulumlar için kullanılmaya devam eder.
 
 ## Kontrol Paneli
 
@@ -481,6 +485,8 @@ adresindeki [web kontrol panelini](/tr/guides/web-dashboard/) açın; hub'da yö
 `ocx update`, Codex CLI'yi değil OpenCodex'in kendisini günceller. Yapılandırılmış Codex CLI adayının provenance bilgisini sınırlı ve salt okunur biçimde denetlemek için [sistem denetim komutları](/tr/reference/cli/agents/) arasındaki `ocx system codex-cli-update check` komutunu kullanın. Komut package registry'ye istek göndermez ve güncelleme kurmaz.
 
 ### `ocx update [--tag latest|preview]`
+
+OpenCodex mise üzerinden kurulduğunda bu komut proxy'yi durdurmadan veya paket dosyalarını değiştirmeden önce başarısız olur ve doğrulanmış yerel mise diğer adını kullanarak `mise upgrade <tool>` komutunu gösterir. Güncelleme denetimi kullanılabilir kalır ve kurulumun harici olarak yönetildiğini bildirir. Okunamayan veya tutarsız mise sahiplik meta verileri de araç adını tahmin etmeden değişikliği reddeder; `--tag preview` mise içinde yapılandırılmış seçimi değiştirmez.
 
 opencodex'i npm'den kendi kendine güncelleyin. Kararlı kurulumlar `@latest`
 kullanır; önizleme kurulumları `--tag latest|preview` iletmediğiniz sürece
