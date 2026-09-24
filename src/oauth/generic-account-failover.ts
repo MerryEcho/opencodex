@@ -581,12 +581,13 @@ export function isGenericOAuthFailoverStatus(
  * The text is never persisted or logged; incomplete, oversized, timed-out, or aborted reads
  * fail closed and leave the original response untouched for the client.
  */
-export async function readGenericOAuthFailoverClassification(
+export async function isGenericOAuthFailoverResponse(
   response: Response,
   providerName: string,
   signal?: AbortSignal,
-): Promise<string | undefined> {
-  if (providerName !== ANTIGRAVITY_FAILOVER_PROVIDER || response.status !== 403) return undefined;
+): Promise<boolean> {
+  if (response.status !== 403) return isGenericOAuthFailoverStatus(response.status, providerName);
+  if (providerName !== ANTIGRAVITY_FAILOVER_PROVIDER) return false;
   try {
     const observed = await readBoundedResponseBody(response.clone(), {
       signal,
@@ -595,9 +596,9 @@ export async function readGenericOAuthFailoverClassification(
       firstByteTimeoutMs: FAILOVER_CLASSIFICATION_TIMEOUT_MS,
       inactivityTimeoutMs: FAILOVER_CLASSIFICATION_TIMEOUT_MS,
     });
-    return observed.displaySafe ? observed.text : undefined;
+    return observed.displaySafe && isAntigravityValidationRequired(observed.text);
   } catch {
-    return undefined;
+    return false;
   }
 }
 
