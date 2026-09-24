@@ -1205,22 +1205,12 @@ export async function preparePassthroughExchange(
         true,
       );
       if (hop.allowed) {
-        let errorDetails: string | undefined;
-        if (upstreamResponse.status === 403 || upstreamResponse.status === 401) {
-          try {
-            const cloned = upstreamResponse.clone();
-            errorDetails = await cloned.text().catch(() => undefined);
-          } catch {
-            // ignore
-          }
-        }
         const nextAccountId = rotateGenericOAuthAccountOnError(
           config, route.providerName, transportState.genericFailoverAccountId,
           upstreamResponse.status,
           upstreamResponse.headers.get("retry-after"),
           Date.now(),
           route.modelId,
-          errorDetails,
         );
         let snapshot: OAuthAccessSnapshot | undefined;
         if (nextAccountId) {
