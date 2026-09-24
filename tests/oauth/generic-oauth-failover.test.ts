@@ -351,7 +351,7 @@ describe("sidecar on429 wiring", () => {
     // Kiro's routing metadata) live in exactly one place. A fourth rotation site that swaps the
     // bearer by hand would reintroduce the mixed-identity bug this helper exists to prevent.
     const snapshotUses = coreSource.match(/failoverAccountSnapshot\(/g) ?? [];
-    const helperUses = coreSource.match(/applyFailoverSnapshot\\(snapshot(?:, (?:nextParsed|retryParsed))?\\)/g) ?? [];
+    const helperUses = coreSource.match(/applyFailoverSnapshot\(snapshot(?:, (?:nextParsed|retryParsed))?\)/g) ?? [];
     // Five includes native Responses passthrough, which returns before the Chat bridge loop.
     // The explicit count keeps a newly added rotation site from skipping identity pairing.
     expect(snapshotUses.length).toBe(5);
