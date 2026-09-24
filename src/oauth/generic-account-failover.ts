@@ -38,6 +38,9 @@ import {
 } from "./pool-kernel";
 import { parseRetryAfterMs } from "../combos/failover";
 import { sweepExpiredOnWrite } from "../lib/state-store-sweeper";
+import { ANTIGRAVITY_REQUEST_UA } from "../adapters/google-antigravity-wire";
+import { resolveAntigravityEffortWireModel } from "../providers/antigravity-models";
+import { getProviderRegistryEntry } from "../providers/registry";
 import type { OcxConfig, OcxProviderConfig } from "../types";
 
 /** Cap same-request rotations so a short Retry-After cannot spin. Default raised to accommodate multi-account pools. */
@@ -99,6 +102,8 @@ interface PresenceEntry {
 /** File-backed dynamic health store (~/.opencodex/oauth-account-health.json). Survives restarts without touching auth.json. */
 const health = new Map<string, AccountHealthRecord>();
 let healthCacheLoaded = false;
+let healthCacheDirty = false;
+let sweepStartTimer: ReturnType<typeof setTimeout> | null = null;
 let sweepTimer: ReturnType<typeof setInterval> | null = null;
 
 function getHealthFilePath(): string {
@@ -132,6 +137,7 @@ export function saveHealthCache(): void {
       obj[key] = value;
     }
     atomicWriteFile(filePath, JSON.stringify(obj, null, 2) + "\n");
+    healthCacheDirty = false;
   } catch (err) {
     console.warn("[opencodex] Failed to save oauth-account-health.json:", err);
   }
@@ -141,6 +147,10 @@ export function ensureHealthCache(): void {
   if (!healthCacheLoaded) {
     loadHealthCache();
   }
+}
+
+function flushHealthCacheIfDirty(): void {
+  if (healthCacheDirty) saveHealthCache();
 }
 
 export function getAccountHealthRecord(provider: string, accountId: string, family?: QuotaModelFamily): AccountHealthRecord | undefined {
@@ -178,7 +188,6 @@ export function recordAccountHealthy(providerName: string, accountId: string, no
 export function recordAccountValidationRequired(
   providerName: string,
   accountId: string,
-  errorMsg?: string,
   now = Date.now(),
 ): void {
   ensureHealthCache();
@@ -190,7 +199,7 @@ export function recordAccountValidationRequired(
     cooldownSource: "error",
     lastCheckedAt: now,
     lastVerifiedAt: existing?.lastVerifiedAt,
-    lastError: errorMsg || "VALIDATION_REQUIRED: Verification required in browser",
+    lastError: "HTTP 403: VALIDATION_REQUIRED",
   });
   saveHealthCache();
 }
@@ -198,7 +207,6 @@ export function recordAccountValidationRequired(
 export function recordAccountAuthFailure(
   providerName: string,
   accountId: string,
-  errorMsg?: string,
   now = Date.now(),
 ): void {
   ensureHealthCache();
@@ -210,7 +218,7 @@ export function recordAccountAuthFailure(
     cooldownSource: "error",
     lastCheckedAt: now,
     lastVerifiedAt: existing?.lastVerifiedAt,
-    lastError: errorMsg || "401 Unauthorized",
+    lastError: "HTTP 401: Unauthorized",
   });
   saveHealthCache();
 }
@@ -229,7 +237,7 @@ function isCooled(provider: string, accountId: string, now: number, family?: Quo
     if (accountEntry.status === "quota_exhausted") {
       accountEntry.status = "healthy";
       accountEntry.cooldownUntil = 0;
-      saveHealthCache();
+      healthCacheDirty = true;
     }
   }
 
@@ -240,7 +248,7 @@ function isCooled(provider: string, accountId: string, now: number, family?: Quo
       if (famEntry.status === "quota_exhausted") {
         famEntry.status = "healthy";
         famEntry.cooldownUntil = 0;
-        saveHealthCache();
+        healthCacheDirty = true;
       }
     }
   }
@@ -338,10 +346,15 @@ export function eligibleFailoverAccounts(providerName: string, now = Date.now(),
       && !isCooled(providerName, account.id, now, family)
       && isAccountHealthy(providerName, account.id, now))
     .map(account => account.id);
-  if (valid.length > 0) return valid;
-  return set.accounts
+  if (valid.length > 0) {
+    flushHealthCacheIfDirty();
+    return valid;
+  }
+  const fallback = set.accounts
     .filter(account => account.needsReauth !== true && !isCooled(providerName, account.id, now, family))
     .map(account => account.id);
+  flushHealthCacheIfDirty();
+  return fallback;
 }
 
 /** Generic pool strategies the kernel can actually run. `quota` IS the pre-kernel path. */
@@ -567,12 +580,11 @@ export function rotateGenericOAuthAccountOnError(
   retryAfterHeader?: string | null,
   now = Date.now(),
   requestedModelId?: string | null,
-  errorText?: string,
 ): string | null {
   if (status === 403) {
-    recordAccountValidationRequired(providerName, failedAccountId, errorText || "HTTP 403: VALIDATION_REQUIRED", now);
+    recordAccountValidationRequired(providerName, failedAccountId, now);
   } else if (status === 401) {
-    recordAccountAuthFailure(providerName, failedAccountId, errorText || "HTTP 401: Unauthorized", now);
+    recordAccountAuthFailure(providerName, failedAccountId, now);
   }
   const cooldownOverrideMs = status === 403 ? 30 * 60_000 : status === 401 ? 15 * 60_000 : undefined;
   return rotateGenericOAuthAccountOn429(config, providerName, failedAccountId, retryAfterHeader, now, requestedModelId, cooldownOverrideMs);
@@ -647,8 +659,12 @@ export function preferredInitialAccount(
 
   const activeRow = selected.accounts.find(account => account.id === active);
   const family = classifyModelFamilyForQuota(providerName, requestedModelId);
+  const activeCooled = activeRow && activeRow.needsReauth !== true
+    ? isCooled(providerName, activeRow.id, now, family)
+    : false;
+  flushHealthCacheIfDirty();
   const activeHealthy = activeRow && activeRow.needsReauth !== true
-    && !isCooled(providerName, activeRow.id, now, family)
+    && !activeCooled
     && isAccountHealthy(providerName, activeRow.id, now)
     && !isAccountQuotaExhausted(providerName, activeRow.id, requestedModelId);
   if (activeHealthy) return null;
@@ -723,16 +739,28 @@ export async function probeGenericOAuthAccount(
       if (!snap.accessToken || !snap.projectId) {
         return { ok: false, status: 401, reason: "Missing accessToken or projectId" };
       }
-      const res = await fetch("https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent", {
+      const registry = getProviderRegistryEntry("google-antigravity");
+      if (!registry?.defaultModel) {
+        return { ok: false, status: 500, reason: "Antigravity probe metadata unavailable" };
+      }
+      const baseUrl = registry.baseUrl.endsWith("/") ? registry.baseUrl : `${registry.baseUrl}/`;
+      const endpoint = new URL("./v1internal:generateContent", baseUrl);
+      const { wireModelId } = resolveAntigravityEffortWireModel(
+        registry.defaultModel,
+        undefined,
+        registry.baseUrl,
+      );
+      const res = await fetch(endpoint, {
         method: "POST",
+        signal: AbortSignal.timeout(20_000),
         headers: {
           "Authorization": `Bearer ${snap.accessToken}`,
           "Content-Type": "application/json",
-          "User-Agent": "antigravity/ide/2.5.5 (Windows; x64) OpenCodex/1.0.0",
+          "User-Agent": ANTIGRAVITY_REQUEST_UA,
           "x-goog-api-client": "google-cloud-code-assist/0.1.0",
         },
         body: JSON.stringify({
-          model: "gemini-3.8-flash-medium",
+          model: wireModelId,
           userAgent: "antigravity",
           requestType: "agent",
           project: snap.projectId,
@@ -745,15 +773,13 @@ export async function probeGenericOAuthAccount(
       if (res.status === 200) {
         return { ok: true, status: 200 };
       }
-      const text = await res.text().catch(() => "");
-      let reason: string | undefined;
-      try {
-        const j = JSON.parse(text);
-        reason = j?.error?.details?.[0]?.reason || j?.error?.message;
-      } catch {
-        reason = text.slice(0, 80);
+      if (res.status === 403) {
+        return { ok: false, status: 403, reason: "HTTP 403: VALIDATION_REQUIRED" };
       }
-      return { ok: false, status: res.status, reason };
+      if (res.status === 401) {
+        return { ok: false, status: 401, reason: "HTTP 401: Unauthorized" };
+      }
+      return { ok: false, status: res.status };
     } catch (err: any) {
       return { ok: false, status: 500, reason: err?.message || String(err) };
     }
@@ -771,7 +797,8 @@ export async function sweepAndHealAccounts(providerName = "google-antigravity"):
   for (const account of set.accounts) {
     const entry = health.get(healthKey(providerName, account.id));
     const needsProbe = !entry
-      || entry.status === "validation_required"
+      || ((entry.status === "validation_required" || entry.status === "auth_failure")
+        && entry.cooldownUntil <= now)
       || entry.status === "unknown"
       || (entry.status === "healthy" && now - entry.lastCheckedAt > 24 * 60 * 60_000);
 
@@ -779,13 +806,14 @@ export async function sweepAndHealAccounts(providerName = "google-antigravity"):
 
     const result = await probeGenericOAuthAccount(providerName, account.id);
     if (result.ok) {
-      const wasBad = entry && entry.status === "validation_required";
+      const wasBad = entry
+        && (entry.status === "validation_required" || entry.status === "auth_failure");
       recordAccountHealthy(providerName, account.id, now);
       if (wasBad) {
         console.log(`[opencodex] Self-healing: account ${providerName}/${account.id.slice(0, 8)} re-verified & restored to rotation pool!`);
       }
-    } else if (result.status === 403 && (result.reason === "VALIDATION_REQUIRED" || result.reason?.includes("Verify your account"))) {
-      recordAccountValidationRequired(providerName, account.id, result.reason, now);
+    } else if (result.status === 403) {
+      recordAccountValidationRequired(providerName, account.id, now);
     } else if (result.status === 429) {
       const key = healthKey(providerName, account.id);
       health.set(key, {
@@ -796,17 +824,18 @@ export async function sweepAndHealAccounts(providerName = "google-antigravity"):
       });
       saveHealthCache();
     } else if (result.status === 401) {
-      recordAccountAuthFailure(providerName, account.id, result.reason, now);
+      recordAccountAuthFailure(providerName, account.id, now);
     }
   }
 }
 
 export function startGenericAccountHealthSweep(): void {
   if (sweepTimer) return;
-  const initial = setTimeout(() => {
+  sweepStartTimer = setTimeout(() => {
+    sweepStartTimer = null;
     void sweepAndHealAccounts("google-antigravity");
   }, 5_000);
-  initial.unref?.();
+  sweepStartTimer.unref?.();
 
   sweepTimer = setInterval(() => {
     void sweepAndHealAccounts("google-antigravity");
@@ -815,6 +844,10 @@ export function startGenericAccountHealthSweep(): void {
 }
 
 export function stopGenericAccountHealthSweep(): void {
+  if (sweepStartTimer) {
+    clearTimeout(sweepStartTimer);
+    sweepStartTimer = null;
+  }
   if (sweepTimer) {
     clearInterval(sweepTimer);
     sweepTimer = null;
