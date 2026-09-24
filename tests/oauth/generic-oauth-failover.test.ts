@@ -342,7 +342,7 @@ describe("sidecar on429 wiring", () => {
     // inline. Inlining is what produced the original defect: three sites each swapped `apiKey`
     // and only two of them remembered the routing metadata paired with it.
     expect(body).toContain("failoverAccountSnapshot(");
-    expect(body).toContain("applyFailoverSnapshot(snapshot)");
+    expect(body).toContain("applyFailoverSnapshot(snapshot, retryParsed)");
     expect(body).not.toContain("apiKey: snapshot.accessToken");
   });
 
@@ -351,7 +351,7 @@ describe("sidecar on429 wiring", () => {
     // Kiro's routing metadata) live in exactly one place. A fourth rotation site that swaps the
     // bearer by hand would reintroduce the mixed-identity bug this helper exists to prevent.
     const snapshotUses = coreSource.match(/failoverAccountSnapshot\(/g) ?? [];
-    const helperUses = coreSource.match(/applyFailoverSnapshot\(snapshot(?:, nextParsed)?\)/g) ?? [];
+    const helperUses = coreSource.match(/applyFailoverSnapshot\\(snapshot(?:, (?:nextParsed|retryParsed))?\\)/g) ?? [];
     // Five includes native Responses passthrough, which returns before the Chat bridge loop.
     // The explicit count keeps a newly added rotation site from skipping identity pairing.
     expect(snapshotUses.length).toBe(5);
