@@ -18,10 +18,11 @@ import {
   loadHealthCache,
   noteGenericPoolSelection,
   preferredInitialAccount,
+  recordAccountAuthFailure,
   recordAccountHealthy,
-  recordAccountValidationRequired,
   rotateGenericOAuthAccountOn429,
   rotateGenericOAuthAccountOnError,
+  sweepAndHealAccounts,
 } from "../../src/oauth/generic-account-failover";
 import { getAccountSet, markAccountNeedsReauth, saveCredential, setActiveAccount } from "../../src/oauth/store";
 import { clearAccountQuotaCache, setCachedProviderAccountQuotaForTests } from "../../src/providers/quota";
@@ -777,7 +778,6 @@ describe("403 and 401 failover and proactive steering", () => {
     await setActiveAccount("google-antigravity", ids[0]!);
 
     const now = Date.now();
-    // Rotate with 403 and error message
     rotateGenericOAuthAccountOnError(
       gaConfig,
       "google-antigravity",
@@ -785,14 +785,12 @@ describe("403 and 401 failover and proactive steering", () => {
       403,
       null,
       now,
-      undefined,
-      "VALIDATION_REQUIRED: Please visit https://accounts.google.com",
     );
 
     expect(isAccountHealthy("google-antigravity", ids[0]!, now)).toBe(false);
     const rec = getAccountHealthRecord("google-antigravity", ids[0]!);
     expect(rec?.status).toBe("validation_required");
-    expect(rec?.lastError).toContain("VALIDATION_REQUIRED");
+    expect(rec?.lastError).toBe("HTTP 403: VALIDATION_REQUIRED");
 
     // Proactive steering steers away from ids[0]
     expect(preferredInitialAccount(gaConfig, "google-antigravity", now + 1000)).toBe(ids[1]!);
@@ -802,7 +800,7 @@ describe("403 and 401 failover and proactive steering", () => {
     expect(isAccountHealthy("google-antigravity", ids[0]!, now)).toBe(false);
     const reloaded = getAccountHealthRecord("google-antigravity", ids[0]!);
     expect(reloaded?.status).toBe("validation_required");
-    expect(reloaded?.lastError).toContain("VALIDATION_REQUIRED");
+    expect(reloaded?.lastError).toBe("HTTP 403: VALIDATION_REQUIRED");
     expect(preferredInitialAccount(gaConfig, "google-antigravity", now + 1000)).toBe(ids[1]!);
 
     // Self-healing: simulate re-verification
@@ -814,5 +812,22 @@ describe("403 and 401 failover and proactive steering", () => {
 
     // After healing and active is healthy, preferredInitialAccount returns null (keeps active)
     expect(preferredInitialAccount(gaConfig, "google-antigravity", now + 2000)).toBeNull();
+  });
+
+  test("auth_failure stays unhealthy until cooldown expiry, then self-heals", async () => {
+    const [accountId] = await seed(1);
+    expect(accountId).toBeDefined();
+
+    const now = Date.now();
+    recordAccountAuthFailure("xai", accountId!, now);
+    await sweepAndHealAccounts("xai");
+    expect(getAccountHealthRecord("xai", accountId!)?.status).toBe("auth_failure");
+    expect(isAccountHealthy("xai", accountId!, now)).toBe(false);
+
+    recordAccountAuthFailure("xai", accountId!, now - 16 * 60_000);
+    await sweepAndHealAccounts("xai");
+    const healed = getAccountHealthRecord("xai", accountId!);
+    expect(healed?.status).toBe("healthy");
+    expect(healed?.lastError).toBeUndefined();
   });
 });
