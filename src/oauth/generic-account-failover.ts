@@ -570,7 +570,10 @@ export function isGenericOAuthFailoverStatus(
   if (status === 429) return true;
   if (providerName !== ANTIGRAVITY_FAILOVER_PROVIDER) return false;
   if (status === 401) return true;
-  return status === 403 && isAntigravityValidationRequired(errorText);
+  if (status !== 403) return false;
+  // Without text this answers only whether the response is worth a bounded classification read.
+  // Once text is supplied, only the concrete validation failure is eligible to rotate.
+  return errorText === undefined || isAntigravityValidationRequired(errorText);
 }
 
 /**
