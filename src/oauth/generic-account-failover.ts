@@ -54,7 +54,6 @@ export function genericOAuthMaxFailovers(providerName?: string): number {
 }
 
 const DEFAULT_COOLDOWN_MS = 60_000;
-const MAX_COOLDOWN_MS = 15 * 60_000;
 
 /**
  * How long a presence answer may be reused before the store is consulted again.
@@ -560,9 +559,9 @@ export function rotateGenericOAuthAccountOn429(
   const set = getAccountSet(providerName);
   if (!set || set.accounts.length < 2) return null;
 
-  const parsed = parseRetryAfterMs(retryAfterHeader, now, { preserveImmediate: true });
+  const parsed = parseRetryAfterMs(retryAfterHeader, now, { preserveImmediate: true, preserveServerDelay: true });
   const exhausted = parsed === undefined ? exhaustedCooldownMs(providerName, failedAccountId, now) : null;
-  const cooldownMs = exhausted ?? Math.min(parsed ?? DEFAULT_COOLDOWN_MS, MAX_COOLDOWN_MS);
+  const cooldownMs = exhausted ?? parsed ?? DEFAULT_COOLDOWN_MS;
   const family = classifyModelFamilyForQuota(providerName, requestedModelId);
   const key = healthKey(providerName, failedAccountId, family);
   const existing = health.get(key) ?? health.get(healthKey(providerName, failedAccountId));
