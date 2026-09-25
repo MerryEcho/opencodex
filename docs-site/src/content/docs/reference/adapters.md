@@ -62,6 +62,11 @@ transport; it does not infer subscription attribution from the inbound protocol.
   collects `usage`. Providers listed in `reasoningDetailsModels` (MiniMax M-series) instead read
   structured `delta.reasoning_details` segments, whose `text` arrives as cumulative snapshots and
   is prefix-diffed, and replay preserved reasoning as a `reasoning_details` array.
+- Suppresses bare `<tool_call>` text when it duplicates a structured call, and collapses two
+  immediately adjacent identical blocks when exactly one structured call agrees with their function
+  and input. A doubled `input` is reduced to one copy, joined either directly or by one newline,
+  and only when the arguments object holds no key besides `input`. Trailing whitespace after the
+  pair is suppressed; mismatched or example markup remains visible.
 - ClinePass uses the live-verified gateway format `reasoning: { enabled: true, effort }` (or
   `{ enabled: false }` when reasoning is disabled); its public API docs do not currently specify
   this request shape. The adapter preserves requested `low`, `medium`, `high`, `xhigh`, and `max`
@@ -212,11 +217,16 @@ only on `/provider/v1/messages`; the pin applies only while the provider points 
 endpoint. It supports forwarding `prompt_cache_key`; this is separate
 from the OAuth adapter's session header and does not guarantee a provider cache hit.
 The OAuth `command-code` preset streams `/alpha/generate` as NDJSON. MiMo tool-call
-markup echoed by the gateway as text is removed when it duplicates a real call. After a
-clean stop or tool-call finish, a complete declared-tool call with no native counterpart
-is restored as a real call; an interrupted or failed turn leaves the markup as text. A
-freeform call echoed without its `</function>` close counts as complete once
-`</tool_call>` arrives. This applies to every MiMo model Command Code serves.
+markup echoed by the gateway as text is removed when it duplicates a real call, including
+markup the gateway appends after ordinary prose in the same chunk; a marker split across
+chunks is still shown as text. Reasoning or other events arriving in between no longer
+release a held envelope. After a clean stop or tool-call finish, a complete declared-tool
+call with no native counterpart is restored as a real call; an interrupted or failed turn
+leaves the markup as text. A call the parser cannot read is dropped rather than printed
+when it still opens, closes, and names a declared tool, and either the real call for that
+tool arrives or the turn finishes cleanly. A freeform call echoed without its
+`</function>` close counts as complete once `</tool_call>` arrives. This applies to every
+MiMo model Command Code serves.
 
 ## `anthropic`
 

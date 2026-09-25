@@ -135,7 +135,13 @@ decision is armed: macOS, persisted resolved Desktop mode first-party, Desktop i
 `claudeCode.intercept.picker !== false`, no disarm latch, listener up, and the current picker CA
 trusted in the login keychain (`picker-trust.ts`). The picker CA (`picker-ca.ts`, under
 `<OPENCODEX_HOME>/claude-picker/`, 0600 key) carries critical name constraints permitting only
-`claude.ai` and is regenerated on reload when they are missing. The relay verifies the upstream
+`claude.ai` and excluding every IPv4 and IPv6 address, and is regenerated on reload when either is
+missing, which gives it a new fingerprint to trust. Trust is added without a policy string: Chromium
+skips host-scoped trust settings, so `inspectPickerTrust` treats a current CA whose exported user
+trust settings carry `kSecTrustSettingsPolicyString` as untrusted and the trust step replaces it; an
+export it cannot read makes trust `unknown`, which never arms. A
+rotated-out picker certificate stays in the login keychain because `untrustPickerCa` removes only the
+current one; its key was overwritten, so it can no longer sign a leaf. The relay verifies the upstream
 certificate, streams every body and upgrade unchanged, and rewrites only the bootstrap response's
 local Code picker surfaces, `ccd` (what the Desktop Code tab reads) and its `code` fallback, never the
 remote `ccr` (`picker-bootstrap.ts`), failing open to the original bytes; the model list
@@ -222,6 +228,10 @@ baseline. Restoration merges into current user fields, preserves unrelated profi
 the previous selection only while the managed profile is still selected. A later valid user
 selection is not changed. A newly created profile with user additions is retained in readable
 standard mode instead of deleting those additions.
+
+During initial enrollment, `src/client/state.ts` records a pending key fingerprint before the token
+is published. Service uninstall retains only the matching key; an unsafe or unreadable marker leaves cleanup unverified. Connect clears its marker on commit or rollback; the marker
+does not claim any Desktop restoration ownership.
 
 A proven legacy current-hub/recognized-key profile without an original baseline can be adopted
 by apply, rotation/recovery or direct disconnect without a new flag or prerequisite reapply.

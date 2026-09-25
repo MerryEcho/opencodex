@@ -31,6 +31,15 @@ NOT count as activity for the bridge's own watchdog: a bounded stall deadline (d
 configurable via `stallTimeoutSec`, checked on the 2 s heartbeat tick) closes the stream with
 `response.incomplete` / `upstream_stall_timeout` and cancels the upstream request if no real
 adapter events arrive. Adapter-yielded `{ type: "heartbeat" }` events DO reset the watchdog.
+The Anthropic adapter maps both SSE comments and `ping` events to that heartbeat (#5707), so an
+upstream that only pings while a long thinking block is silent still counts as live.
+When the Responses-to-Chat converter receives that typed heartbeat, it emits the same bounded SSE
+comment after ensuring the initial assistant-role chunk. Chat clients therefore keep receiving
+transport bytes during long reasoning without a fabricated content/tool/usage event. The comment
+does not reset a semantic-progress watchdog, and it does not alter the bridge's upstream stall or
+cancellation decisions.
+
+> Decision record: [ADR-5805](../decisions/ADR-5805-chat-completions-heartbeat-relay.md)
 
 Top-level `emptyCompletionRetry: true` opts Responses turns into one identical replay when an
 upstream turn produces neither output text nor a tool call, including a stream that ends before a
@@ -211,7 +220,12 @@ the upgrade with 426 so Codex falls back to HTTP cleanly.
 
 That setting controls the client-facing upgrade only. The transparent upstream
 ChatGPT WS optimization described above is selected independently and still
-returns the same downstream SSE contract. Its WSS route checks NO_PROXY first, then selects the
+returns the same downstream SSE contract. The canonical `openai` provider uses
+upstream WebSocket by default; `providers.openai.upstreamWebsocket: false` sends
+its streaming turns over HTTP/SSE instead. This explicit choice also makes
+native mid-turn steering and injection unavailable on that provider. It does
+not change the endpoint, credential, or downstream event format.
+Its WSS route checks NO_PROXY first, then selects the
 first non-empty HTTPS_PROXY, https_proxy, ALL_PROXY, or all_proxy value. HTTP_PROXY alone does not
 route WSS. Unsupported or malformed selected proxy values skip the WebSocket attempt and use the
 existing SSE path immediately; they never fall through to a lower-priority proxy or direct WebSocket

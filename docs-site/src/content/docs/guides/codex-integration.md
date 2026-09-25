@@ -98,6 +98,13 @@ is a `POST` to the canonical Responses URL or a configured WebSocket route, and 
 falls back to it when the request cannot be prepared, the `response.create` frame exceeds its size
 limit, or the proxy route cannot carry the socket.
 
+To keep the built-in ChatGPT provider on HTTP/SSE, set `providers.openai.upstreamWebsocket`
+to `false` in `~/.opencodex/config.json` and restart the proxy. Merge this field into the
+existing `openai` provider; preserve its account mode and other settings. Omit the field
+to restore the default upstream WebSocket selection. This setting does not change the
+client-facing `websockets` switch or the ChatGPT account used for the request. Native
+mid-turn steering and injection need upstream WebSocket and are unavailable while it is off.
+
 Local provider pacing can also hold a request before it is dispatched at all. So a slow first
 output has several possible contributors, and upstream queueing is only one of them. `ocx doctor`
 classifies configuration and measures none of these: compare actual transport, pacing, network,
@@ -604,6 +611,10 @@ The same repair covers the goal helpers. A routed model that calls `create_goal`
 code-mode `exec` has the call converted into the matching `tools.<helper>(...)` call inside
 `exec`. A catalog that genuinely declares the bare goal tool keeps it, and a catalog that declares
 neither the tool nor `exec` still rejects the call as undeclared.
+
+For routed Responses turns, an explicit tool-enforcement policy also rejects client tool calls if
+the request's declared-tool catalog is unavailable. An empty declared catalog rejects every client
+tool call; Chat and Anthropic clients retain their own tool-validation responsibility.
 
 Routed code-mode turns are also told the host's rules for the nested helpers before the first
 call: `tools.apply_patch` takes one string that opens and closes with the bare patch marker lines,

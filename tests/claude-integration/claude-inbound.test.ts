@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { AnthropicRequestError as LeafAnthropicRequestError } from "../../src/claude/inbound-records";
 import { repoPath } from "../helpers/repo-root";
@@ -517,6 +518,31 @@ describe("prompt cache key provenance (devlog 130 B3)", () => {
     });
     expect(cacheKeySource).toBe("metadata");
     expect(body.prompt_cache_key).toMatch(/^[0-9a-f]{32}$/);
+  });
+
+  test("metadata.user_id longer than 64 chars is hashed into user (OpenAI/Azure limit)", () => {
+    const userId = JSON.stringify({ device_id: "d".repeat(64), account_uuid: "", session_id: "s".repeat(36) });
+    const { body } = anthropicToResponsesTranslation({
+      model: "m", max_tokens: 1, messages,
+      metadata: { user_id: userId },
+    });
+    expect(body.user).toBe(createHash("sha256").update(userId).digest("hex"));
+    expect(body.prompt_cache_key).toBe(createHash("sha256").update(userId).digest("hex").slice(0, 32));
+  });
+
+  test("metadata.user_id boundary: exactly 64 chars forwarded, 65 chars hashed", () => {
+    const atLimit = "u".repeat(64);
+    const overLimit = "u".repeat(65);
+    const { body: forwarded } = anthropicToResponsesTranslation({
+      model: "m", max_tokens: 1, messages,
+      metadata: { user_id: atLimit },
+    });
+    expect(forwarded.user).toBe(atLimit);
+    const { body: hashed } = anthropicToResponsesTranslation({
+      model: "m", max_tokens: 1, messages,
+      metadata: { user_id: overLimit },
+    });
+    expect(hashed.user).toBe(createHash("sha256").update(overLimit).digest("hex"));
   });
 
   test("no metadata + system present: fallback key from system hash, source=system", () => {

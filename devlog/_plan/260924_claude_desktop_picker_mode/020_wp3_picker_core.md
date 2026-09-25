@@ -31,17 +31,29 @@ egress profile; with no profile applied, none of this code sees Desktop traffic.
  const OID = {
 +  nameConstraints: "2.5.29.30",
  …
-+export interface AuthorityOptions { commonName: string; permittedDnsNames?: readonly string[] }
++export interface AuthorityOptions {
++  commonName: string;
++  permittedDnsNames?: readonly string[];
++  excludeAllIpAddresses?: boolean; // default true (#5731)
++}
 +
-+/** RFC 5280 NameConstraints with permittedSubtrees of dNSName bases only. */
-+function nameConstraints(permitted: readonly string[]): Uint8Array {
++/** iPAddress bases (address + mask, all zero) covering every IPv4 and every IPv6 address. */
++export const ALL_IP_ADDRESS_BASES: readonly Uint8Array[] = [new Uint8Array(8), new Uint8Array(32)];
++
++/** RFC 5280 NameConstraints: permittedSubtrees of dNSName bases, excludedSubtrees of every IP. */
++function nameConstraints(permitted: readonly string[], excludeAllIpAddresses: boolean): Uint8Array {
 +  const subtrees = permitted.map(name => sequence(contextTag(2, new TextEncoder().encode(name), false)));
-+  return sequence(contextTag(0, concat(...subtrees)));
++  const excluded = ALL_IP_ADDRESS_BASES.map(base => sequence(contextTag(7, base, false)));
++  return sequence(
++    contextTag(0, concat(...subtrees)),
++    ...(excludeAllIpAddresses ? [contextTag(1, concat(...excluded))] : []),
++  );
 +}
 +
 +export function createCertificateAuthority(options: AuthorityOptions): LocalInterceptCa { …same body as
 +  createLocalInterceptCa, with commonName from options and, when permittedDnsNames is non-empty,
-+  extension(OID.nameConstraints, true, nameConstraints(options.permittedDnsNames)) … }
++  extension(OID.nameConstraints, true, nameConstraints(options.permittedDnsNames,
++    options.excludeAllIpAddresses !== false)) … }
 +export function issueServerLeaf(ca: LocalInterceptCa, issuerCommonName: string, hosts: readonly string[]): PemKeyPair
 -export function createLocalInterceptCa(): LocalInterceptCa { …
 +export function createLocalInterceptCa(): LocalInterceptCa {
@@ -74,10 +86,13 @@ export function issuePickerLeaf(ca: PickerCa, configDir: string): PemKeyPair; //
 Reload validation (audit wp3 r1, High). The shared loader only checks CA status, key pairing and
 self-signature, so `ensurePersistedAuthority` gains `accept?: (cert: X509Certificate) => boolean`,
 and `ensurePickerCa` passes one that requires subject CN `PICKER_CA_COMMON_NAME` and a **critical**
-nameConstraints extension whose permittedSubtrees hold exactly one dNSName, `claude.ai`, and no
-excludedSubtrees. A persisted CA that fails it (for example a valid, key-matching CA without
-constraints) is regenerated under the lease. The new fingerprint makes trust `untrusted` until the
-operator trusts it again, so an unconstrained root is never loaded and trusted as the picker CA.
+nameConstraints extension whose permittedSubtrees hold exactly one dNSName, `claude.ai`, and
+whose excludedSubtrees hold exactly two iPAddress bases, all-zero IPv4 (8 bytes) and all-zero IPv6
+(32 bytes), so no IP-address leaf chains to it (PR #5731 review: a DNS-only permitted list leaves the
+iPAddress form unconstrained). A persisted CA that fails it (for example a valid, key-matching CA
+without constraints, or the first claude.ai-only format) is regenerated under the lease. The new
+fingerprint makes trust `untrusted` until the operator trusts it again, so an unconstrained root is
+never loaded and trusted as the picker CA.
 
 ## picker-trust.ts
 
@@ -91,9 +106,15 @@ export async function inspectPickerTrust(leafPath: string, caSha1: string, run?:
 //   darwin only; "trusted" needs both:
 //   1. ["find-certificate", "-a", "-Z", "-c", PICKER_CA_COMMON_NAME, loginKeychainPath()] lists caSha1 (the current CA)
 //   2. ["verify-cert", "-q", "-L", "-c", leafPath, "-p", "ssl", "-n", "claude.ai", "-k", loginKeychainPath()] exits 0
+//   3. ["trust-settings-export", <temp plist>] does not show kSecTrustSettingsPolicyString in the
+//      caSha1 entry (a host-scoped setting from an earlier build; Chromium skips it, so it counts
+//      as untrusted and the trust step replaces it); an unreadable export → unknown, so the picker
+//      never arms on a setting it could not inspect
 //   missing record or exit 1 → untrusted; a runner failure → unknown
 export async function trustPickerCa(caPath: string, run?: SecurityRunner, platform?: NodeJS.Platform): Promise<{ ok: boolean; reason?: "unsupported" | "declined_or_failed" }>;
-//   ["add-trusted-cert", "-r", "trustRoot", "-p", "ssl", "-s", "claude.ai", "-k", loginKeychainPath(), caPath]
+//   ["add-trusted-cert", "-r", "trustRoot", "-p", "ssl", "-k", loginKeychainPath(), caPath]
+//   (no "-s claude.ai": found in the live proof, Chromium skips host-scoped trust settings and
+//   Desktop failed with ERR_CERT_AUTHORITY_INVALID; the name constraints do the scoping)
 export async function untrustPickerCa(caPath: string, fingerprintSha1: string, run?: SecurityRunner, platform?: NodeJS.Platform): Promise<{ ok: boolean }>;
 //   ["remove-trusted-cert", caPath] then ["delete-certificate", "-Z", fingerprintSha1, loginKeychainPath()]
 ```

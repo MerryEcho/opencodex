@@ -390,6 +390,8 @@ that shows the same client resending.
 
 The existing provider HTTP-status policy and the shared physical-send budget remain
 independent: zero refuses dispatch, invalid counts fail, and a stopped send is counted once.
+A denied first combo target returns a local typed 429 `request_send_budget_exhausted` without
+dispatch; a denied later hop returns the last real upstream failure without contacting that target.
 `src/bridge/errors.ts` retains only the allowlisted non-replayable transport codes,
 reapplies the in-process marker, attaches no `Retry-After`, and restates 429 for the refusal
 code alone so a combo or adapter formatter holding an upstream-shaped 502 cannot hand the
@@ -413,6 +415,8 @@ output actually share. When the caller declared `max_output_tokens`,
 `checkComboTargetInputAdmission` requires both `estimated input <= ceiling` and
 `estimated input + min(declared output, target output ceiling) <= window`, so the output reserve
 is counted once rather than charged twice against an already-tightened input budget.
+Both direct and combo estimates omit replayed assistant thinking for `openai-chat` models outside
+`preserveReasoningContentModels`, matching the adapter's wire omission; other targets still count it.
 
 The refusal is local: HTTP 413 `input_admission_refused` before any upstream bytes are sent, which
 existing combo policy already treats as a safe hop. That ordering is the whole point. A target whose

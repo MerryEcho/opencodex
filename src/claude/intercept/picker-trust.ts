@@ -1,4 +1,5 @@
-import { homedir } from "node:os";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { PICKER_CA_COMMON_NAME, PICKER_HOST } from "./picker-ca";
 
@@ -28,6 +29,32 @@ function hasFingerprint(output: string, expected: string): boolean {
   });
 }
 
+/**
+ * Whether the current CA's user trust settings carry a policy string (a host scope such as the
+ * `-s claude.ai` earlier builds used). verify-cert honours those, but Chromium skips them, so
+ * Desktop would reject the picker leaf; the CA then counts as untrusted and trust is added again,
+ * which replaces the setting. `null` when the settings cannot be read; the caller then reports
+ * `unknown`, because arming on a setting Chromium skips would cut Desktop off from claude.ai.
+ */
+async function hostScopedTrust(caSha1: string, run: SecurityRunner): Promise<boolean | null> {
+  let dir: string | undefined;
+  try {
+    dir = mkdtempSync(join(tmpdir(), "ocx-picker-trust-"));
+    const file = join(dir, "trust-settings.plist");
+    if ((await run(["trust-settings-export", file])).code !== 0) return null;
+    const xml = readFileSync(file, "utf8");
+    const at = xml.indexOf(`<key>${caSha1.replace(/:/g, "").toUpperCase()}</key>`);
+    if (at < 0) return false;
+    // The entry's trustSettings array holds flat dictionaries, so its first </array> ends it.
+    const end = xml.indexOf("</array>", at);
+    return xml.slice(at, end < 0 ? undefined : end).includes("<key>kSecTrustSettingsPolicyString</key>");
+  } catch { // no-excuse-ok: catch -- unreadable trust settings are no evidence of a host scope.
+    return null;
+  } finally {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 export async function inspectPickerTrust(
   leafPath: string,
   caSha1: string,
@@ -43,7 +70,11 @@ export async function inspectPickerTrust(
     if (!hasFingerprint(found.stdout, caSha1)) return "untrusted";
     const verified = await run(["verify-cert", "-q", "-L", "-c", leafPath,
       "-p", "ssl", "-n", PICKER_HOST, "-k", keychain]);
-    return verified.code === 0 ? "trusted" : verified.code === 1 ? "untrusted" : "unknown";
+    if (verified.code === 0) {
+      const scoped = await hostScopedTrust(caSha1, run);
+      return scoped === null ? "unknown" : scoped ? "untrusted" : "trusted";
+    }
+    return verified.code === 1 ? "untrusted" : "unknown";
   } catch { // no-excuse-ok: catch -- OS command unavailable or denied; never claim trust.
     return "unknown";
   }
@@ -56,8 +87,11 @@ export async function trustPickerCa(
 ): Promise<{ ok: boolean; reason?: "unsupported" | "declined_or_failed" }> {
   if (platform !== "darwin") return { ok: false, reason: "unsupported" };
   try {
+    // No `-s <host>` policy string: Chromium (Claude Desktop) skips trust settings that carry one,
+    // so a host-scoped setting leaves Desktop rejecting the picker leaf. The CA's critical name
+    // constraints already limit it to claude.ai; macOS verify-cert rejects any other name.
     const result = await run(["add-trusted-cert", "-r", "trustRoot", "-p", "ssl",
-      "-s", PICKER_HOST, "-k", loginKeychainPath(), caPath]);
+      "-k", loginKeychainPath(), caPath]);
     return result.code === 0 ? { ok: true } : { ok: false, reason: "declined_or_failed" };
   } catch { // no-excuse-ok: catch -- user decline and command failure share a safe result.
     return { ok: false, reason: "declined_or_failed" };

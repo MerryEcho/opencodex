@@ -1,4 +1,5 @@
 import { normalizeRoutedAgentMessages } from "../routed-agent-messages";
+import { nameRoutedIdentity, repairIdentityInResponsesBody, stripRoutedIdentity } from "../identity";
 import { stripBracketedModelSuffix } from "../openai-chat";
 import { normalizeOpenCodeGoAdditionalTools } from "../opencode-go-additional-tools";
 import { isXaiResponsesDestination } from "../../providers/xai-transport";
@@ -268,6 +269,17 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
       if (!forward) outBody = normalizeRoutedAgentMessages(outBody, {
         allowStringContent: isXaiResponsesDestination(provider),
       });
+      // #5217: a sub-agent inherits the parent session's instruction block, so the identity
+      // sentence this proxy generated for the PARENT's model rides along to a worker running a
+      // different one. On a routed destination it is renamed to that destination — including the
+      // model-neutral catalog sentence, which this adapter never names itself; on a native/forward
+      // destination our sentence is dropped, because Codex's own identity wording (sent in the
+      // client's model_switch block) is the correct one there. Text the proxy did not generate —
+      // user turns, tool output, fenced code, provider-native blocks — is untouched.
+      outBody = repairIdentityInResponsesBody(
+        outBody,
+        forward ? stripRoutedIdentity : (text: string) => nameRoutedIdentity(text, parsed.modelId),
+      );
       outBody = mapRoutedResponsesReasoningEffort(outBody, provider, parsed.modelId);
       // stripPreviousResponseId() intentionally returns its input on a no-op. Detach before the
       // tier write so a force-fast/default decision can never mutate parsed._rawBody.
@@ -312,9 +324,11 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
         outBody = normalizeResponsesToolResultAdjacency(outBody);
       }
       if (forward) {
-        outBody = stripUnsupportedForwardParams(outBody);
-        // Only the canonical ChatGPT backend rejects the retired field; a self-hosted or
-        // third-party forward gateway may still accept it, so this must not be widened.
+        // `metadata` is stripped on every forward route for compatibility with the canonical backend.
+        // `max_output_tokens` is stripped only when this provider is the canonical backend.
+        outBody = stripUnsupportedForwardParams(outBody, isCanonicalOpenAiForwardProvider(provider));
+        // Only the canonical ChatGPT backend rejects the canonical-only fields below; a self-hosted
+        // or third-party forward gateway may accept them, so this guard must not be widened.
         if (isCanonicalOpenAiForwardProvider(provider)) {
           outBody = stripCanonicalForwardSamplingParams(outBody);
           outBody = stripDeprecatedPromptCacheRetention(outBody, parsed.modelId);
@@ -460,6 +474,7 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
                   dropNullContentChannel: !isOpenAiOperatedResponsesDestination(provider),
                   stripEncryptedContent: threadServingIdentityChanged || requiresPlaintextReasoningReplay(provider),
                   dropForeignItemId: parsed._dropForeignReasoningItemIds === true,
+                  requirePlaintextReasoning: requiresPlaintextReasoningReplay(provider),
                 },
               ),
               provider,

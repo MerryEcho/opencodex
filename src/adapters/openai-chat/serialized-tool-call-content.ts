@@ -1,5 +1,6 @@
 import type { TranslatorBudget } from "../../lib/translator-budget";
 import type { AdapterEvent } from "../../types";
+import { repairFreeformToolInput } from "../../responses/apply-patch-envelope";
 
 const OPEN_TAG = "<tool_call>";
 const CLOSE_TAG = "</tool_call>";
@@ -27,33 +28,103 @@ export interface SerializedToolCall {
   end: number;
 }
 
+/** A freeform tool's declared identity. Echoes are matched against it, never against the wire alias. */
+export interface FreeformToolIdentity {
+  name: string;
+  namespace?: string;
+}
+
+/** The request's freeform tools keyed by the wire name the provider sees for each of them. */
+export function freeformToolsByWireName<T extends FreeformToolIdentity & { freeform?: boolean }>(
+  tools: readonly T[] | undefined,
+  wireName: (tool: T) => string,
+): Map<string, FreeformToolIdentity> {
+  return new Map(tools?.filter(tool => tool.freeform).map(tool => [wireName(tool), { name: tool.name, namespace: tool.namespace }] as const) ?? []);
+}
+
 export interface StructuredToolCallReference {
   names: ReadonlySet<string>;
   argumentsText: string;
+  freeformTool?: FreeformToolIdentity;
+}
+
+const BLOCK_HEADER = /<tool_call>\s*<function=([^>\r\n]+)>/y;
+/** A separate bare block starts a line (see `splitAtPossibleSerializedToolCall`); a header mid-line is body text. */
+const NEXT_BLOCK_HEADER = /\n<tool_call>\s*<function=[^>\r\n]+>/g;
+const FUNCTION_CLOSE = "</function>";
+const PARAMETER_CLOSE = "</parameter>";
+
+function trimmedEnd(text: string, from: number, to: number): number {
+  while (to > from && /\s/.test(text[to - 1]!)) to--;
+  return to;
+}
+
+function endsWithAt(text: string, from: number, to: number, suffix: string): boolean {
+  return to - suffix.length >= from && text.startsWith(suffix, to - suffix.length);
+}
+
+/**
+ * The block starting at `offset`, read by delimiter scan so an unterminated block costs linear time.
+ * MiMo's echo may close a freeform body with a stray `</parameter>` and may omit `</function>`
+ * (#5724), the grammar the Command Code reader accepts too. The first `</tool_call>` preceded by
+ * `</function>` closes the block, so a body can still carry a literal `</tool_call>` or header;
+ * with none before the next line-start block header, the first `</tool_call>` does. That header only
+ * bounds an unclosed candidate: with no close at all before it, it is body text, and a closed
+ * `</function></tool_call>` after it still ends the block.
+ */
+function blockAt(text: string, offset: number): SerializedToolCall | undefined {
+  BLOCK_HEADER.lastIndex = offset;
+  const header = BLOCK_HEADER.exec(text);
+  if (!header) return undefined;
+  const bodyStart = offset + header[0].length;
+  NEXT_BLOCK_HEADER.lastIndex = bodyStart;
+  const next = NEXT_BLOCK_HEADER.exec(text);
+  const limit = next ? next.index + 1 : text.length;
+  let unclosed: SerializedToolCall | undefined;
+  for (let close = text.indexOf(CLOSE_TAG, bodyStart); close >= 0 && (close < limit || !unclosed);
+    close = text.indexOf(CLOSE_TAG, close + CLOSE_TAG.length)) {
+    let bodyEnd = trimmedEnd(text, bodyStart, close);
+    const closed = endsWithAt(text, bodyStart, bodyEnd, FUNCTION_CLOSE);
+    if (closed) bodyEnd = trimmedEnd(text, bodyStart, bodyEnd - FUNCTION_CLOSE.length);
+    if (endsWithAt(text, bodyStart, bodyEnd, PARAMETER_CLOSE)) bodyEnd -= PARAMETER_CLOSE.length;
+    const call = {
+      name: header[1]!.trim(),
+      body: text.slice(bodyStart, bodyEnd),
+      start: offset,
+      end: close + CLOSE_TAG.length,
+    };
+    if (closed) return call;
+    if (close < limit) unclosed ??= call;
+  }
+  return unclosed;
 }
 
 /** Finds complete bare blocks outside literal Markdown; ambiguous outer blocks stop the scan. */
 function callsIn(text: string, context: TextContext = { fence: null, lineStart: true }): SerializedToolCall[] {
-  const pattern = /<tool_call>\s*<function=([^>\r\n]+)>([\s\S]*?)(?:<\/parameter>)?\s*<\/function>\s*<\/tool_call>/y;
   const calls: SerializedToolCall[] = [];
   let offset = 0;
   while (offset < text.length) {
     const split = splitAtPossibleSerializedToolCall(text.slice(offset), context, true);
     offset += split.emit.length;
     if (!split.hasOpenTag) break;
-    pattern.lastIndex = offset;
-    const match = pattern.exec(text);
+    const match = blockAt(text, offset);
     if (!match) break; // An incomplete/ambiguous outer block cannot authorize an inner call.
-    calls.push({
-      name: match[1]!.trim(),
-      body: match[2]!,
-      start: match.index,
-      end: match.index + match[0].length,
-    });
-    offset = pattern.lastIndex;
+    calls.push(match);
+    offset = match.end;
     context = { fence: null, lineStart: false };
   }
   return calls;
+}
+
+/**
+ * The first block, and only when the text after it is exactly one repetition of that same block
+ * (trailing whitespace allowed). The returned range covers the pair and any trailing whitespace.
+ */
+function repeatedCallIn(text: string, context?: TextContext): SerializedToolCall | undefined {
+  const first = callsIn(text, context)[0];
+  if (!first) return undefined;
+  if (text.slice(first.end).trimEnd() !== text.slice(first.start, first.end).trimEnd()) return undefined;
+  return { ...first, end: text.length };
 }
 
 /** Splits safe visible text from a possible control block while carrying Markdown context across chunks. */
@@ -267,16 +338,53 @@ export class SerializedToolCallContentBuffer {
   }
 }
 
-/** Reads only a string input from a JSON object; other argument shapes cannot prove duplication. */
-function inputFromArguments(argumentsText: string): string | undefined {
+/** Reads a wrapped input or raw arguments from a declared freeform tool; neither path rewrites them. */
+function inputFromArguments(
+  argumentsText: string,
+  freeformTool?: FreeformToolIdentity,
+): string | undefined {
   try {
     const parsed = JSON.parse(argumentsText) as unknown;
-    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
-    const input = (parsed as Record<string, unknown>).input;
-    return typeof input === "string" ? input : undefined;
+    const input = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>).input
+      : undefined;
+    if (typeof input === "string") return input;
   } catch {
-    return undefined;
+    // Chat gateways can send custom-tool input as raw text.
   }
+  if (!freeformTool) return undefined;
+  // Match raw input only when the Responses bridge dispatches these same bytes. It can unwrap
+  // alternate fields or repair freeform input using the declared tool's name and namespace.
+  return repairFreeformToolInput(argumentsText, freeformTool.name, freeformTool.namespace) === argumentsText
+    ? argumentsText : undefined;
+}
+
+/** One wrapping newline after the function header is template layout, not input (vLLM `_trim_wrapping_newlines`). */
+function freeformBody(value: string): string {
+  return value.replace(/^\r?\n/, "").trimEnd();
+}
+
+/**
+ * Whether a structured call's freeform input already equals the body of `repeated`. Such a call
+ * explains the repeated pair on its own, which is what competes with a doubled call in the same
+ * batch: both readings account for the two blocks, and the response never says which one it meant.
+ */
+function agreesWithRepeatedBlock(
+  structured: StructuredToolCallReference,
+  repeated: SerializedToolCall,
+): boolean {
+  const input = structured.names.has(repeated.name) ? inputFromArguments(structured.argumentsText, structured.freeformTool) : undefined;
+  return input !== undefined && freeformBody(input) === freeformBody(repeated.body);
+}
+
+/** A second call can explain a repeated pair even when its arguments cannot safely be rewritten. */
+function hasDoubledInput(structured: StructuredToolCallReference, repeated: SerializedToolCall): boolean {
+  if (!structured.names.has(repeated.name)) return false;
+  const input = inputFromArguments(structured.argumentsText, structured.freeformTool);
+  if (input === undefined) return false;
+  const body = freeformBody(repeated.body);
+  const normalized = freeformBody(input);
+  return normalized === body + body || normalized === body + "\n" + body;
 }
 
 /** The `[start, end)` ranges of blocks whose function identity and freeform input match a dispatched call. */
@@ -286,10 +394,20 @@ function duplicatedSerializedToolCallRanges(
   context?: TextContext,
 ): { start: number; end: number }[] {
   if (structuredCalls.length === 0) return [];
+  const repeated = repeatedCallIn(text, context);
+  if (repeated) {
+    // A doubled call beside an agreeing call leaves the pair ambiguous. If reduction was
+    // refused, keep the markup too: otherwise the visible text and executable call disagree.
+    const matching = structuredCalls.filter(structured => agreesWithRepeatedBlock(structured, repeated));
+    const doubled = structuredCalls.some(structured => structured !== matching[0] && hasDoubledInput(structured, repeated));
+    return matching.length === 1 && !doubled ? [{ start: repeated.start, end: repeated.end }] : [];
+  }
   return callsIn(text, context).filter(call => {
-    const body = call.body.trimEnd();
-    return structuredCalls.some(structured =>
-      structured.names.has(call.name) && inputFromArguments(structured.argumentsText)?.trimEnd() === body);
+    const body = freeformBody(call.body);
+    return structuredCalls.some(structured => {
+      const input = structured.names.has(call.name) ? inputFromArguments(structured.argumentsText, structured.freeformTool) : undefined;
+      return input !== undefined && freeformBody(input) === body;
+    });
   });
 }
 
@@ -306,6 +424,32 @@ export function stripDuplicatedSerializedToolCalls(
     cursor = range.end;
   }
   return result + text.slice(cursor);
+}
+
+/**
+ * The reduced arguments when the freeform body of the repeated block is written twice in the
+ * single string "input" field, or undefined for any other shape. Only the batch reconciler may
+ * apply it: the reduction rewrites executable arguments, so it needs a uniqueness proof.
+ */
+function doubledInputReduction(
+  argumentsText: string,
+  functionNames: ReadonlySet<string>,
+  repeated: SerializedToolCall,
+): string | undefined {
+  if (!functionNames.has(repeated.name)) return undefined;
+  const body = freeformBody(repeated.body);
+  try {
+    const parsed = JSON.parse(argumentsText) as unknown;
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+        && Object.keys(parsed).length === 1
+        && ((parsed as Record<string, unknown>).input === body + body
+          || (parsed as Record<string, unknown>).input === body + "\n" + body)) {
+      return JSON.stringify({ input: body });
+    }
+  } catch {
+    // A malformed concatenation is handled by the prefix repair instead.
+  }
+  return undefined;
 }
 
 /** Removes a malformed argument prefix only when a bare block and the JSON suffix prove identical input. */
@@ -346,9 +490,68 @@ export function repairArgumentsDuplicatedBesideSerializedCall(
   return argumentsText;
 }
 
+/** One structured call as the reconciler sees it, before its arguments meet the visible text. */
+export interface StructuredToolCallInput {
+  wireName: string;
+  restoredName: string;
+  argumentsText: string;
+  freeformTool?: FreeformToolIdentity;
+}
+
+/**
+ * Repairs the arguments of every structured call in one response against the visible text that
+ * response carried, and returns them in input order. The per-call prefix repair stands alone,
+ * because the markup it proves is matched against that call's own repaired input. The
+ * doubled-input reduction is applied only when exactly one call in the batch explains the repeated
+ * pair, including doubled shapes that cannot themselves be rewritten. It rewrites executable
+ * arguments, so a second explanatory call leaves the pair ambiguous.
+ */
+export function reconcileStructuredToolCalls(
+  calls: readonly StructuredToolCallInput[],
+  serializedText: string,
+): StructuredToolCallReference[] {
+  const references = calls.map(call => {
+    const names = new Set([call.wireName, call.restoredName]);
+    return { names, freeformTool: call.freeformTool, argumentsText: repairArgumentsDuplicatedBesideSerializedCall(call.argumentsText, names, serializedText) };
+  });
+  return reduceUnambiguousDoubledInput(references, serializedText);
+}
+
+/**
+ * Applies the doubled-input reduction across the batch. The doubled shape is valid JSON, so the
+ * prefix repair returns it untouched, and the reduction only ever rewrites a call the repair left
+ * alone. A call whose input already equals the repeated body is a competing explanation, not a
+ * bystander: both readings account for the pair and the response never picks one, so a batch with
+ * two qualifying calls keeps every argument exactly as sent. The reduction then rewrites nothing,
+ * and the range matcher keeps the markup when a doubled call competes with an agreeing call.
+ * An already-agreeing call leaves nothing to reduce.
+ */
+function reduceUnambiguousDoubledInput(
+  references: readonly StructuredToolCallReference[],
+  serializedText: string,
+): StructuredToolCallReference[] {
+  const repeated = repeatedCallIn(serializedText);
+  if (!repeated) return [...references];
+  const candidates = references.map(reference => ({
+    reduction: doubledInputReduction(reference.argumentsText, reference.names, repeated),
+    explains: agreesWithRepeatedBlock(reference, repeated),
+    doubled: hasDoubledInput(reference, repeated),
+  }));
+  if (candidates.filter(candidate => candidate.explains || candidate.doubled).length !== 1) {
+    return [...references];
+  }
+  return references.map((reference, index) => {
+    const reduction = candidates[index]!.reduction;
+    return reduction === undefined ? reference : { ...reference, argumentsText: reduction };
+  });
+}
+
 /**
  * One structured call as the reconciler sees it: both the wire name and its restored client name
  * identify it, and its arguments are repaired against the visible text the same response carried.
+ * A single call is its own batch, so the doubled-input reduction still applies here; a caller
+ * holding several calls of one response must pass them together to
+ * `reconcileStructuredToolCalls` so the reduction sees all of them.
  */
 export function reconcileStructuredToolCall(
   wireName: string,
@@ -356,8 +559,7 @@ export function reconcileStructuredToolCall(
   argumentsText: string,
   serializedText: string,
 ): StructuredToolCallReference {
-  const names = new Set([wireName, restoredName]);
-  return { names, argumentsText: repairArgumentsDuplicatedBesideSerializedCall(argumentsText, names, serializedText) };
+  return reconcileStructuredToolCalls([{ wireName, restoredName, argumentsText }], serializedText)[0]!;
 }
 
 /**
