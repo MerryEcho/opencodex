@@ -39,6 +39,7 @@ import {
   formatAnthropicProviderForLog,
 } from "../../oauth/anthropic-routing";
 import {
+  hasEligibleGenericOAuthFailoverTarget,
   genericOAuthMaxFailovers,
   isGenericOAuthFailoverEnabled,
   isGenericOAuthFailoverStatus,
@@ -341,7 +342,7 @@ export function createAdapterContinuations(
           route.provider = rotated;
           invalidateSameTargetRequest();
           transportState.activeAdapter = resolveSelectionAdapter(
-            resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire),
+            resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire, route.staticPolicy),
             config.cacheRetention,
           );
           bindRouteReasoningReplayScope({
@@ -387,7 +388,7 @@ export function createAdapterContinuations(
             invalidateSameTargetRequest();
             logCtx.provider = formatAnthropicProviderForLog("anthropic", admitted.accountId, config);
             transportState.activeAdapter = resolveSelectionAdapter(
-              resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire),
+              resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire, route.staticPolicy),
               config.cacheRetention,
             );
             sealRequestAttemptIdentity(logCtx.activeAttempt, logCtx.provider, transportState.activeAdapter.name, logCtx.accountLogLabel);
@@ -438,9 +439,11 @@ export function createAdapterContinuations(
             response.status === 403 ? "VALIDATION_REQUIRED" : undefined,
           )
           : null;
-        // Eligible and refused by the shared budget, as opposed to eligible and finding no next
-        // account: the two produce the same response and need different follow-ups (#5044).
-        if (!hop.allowed) noteAttemptRecoveryWithheld(logCtx.activeAttempt, "rotation-send-budget");
+        // A roster quorum ignores cooldowns, so only attribute a budget refusal when the
+        // non-mutating selector confirms that an alternate account could serve this model now.
+        if (!hop.allowed && hasEligibleGenericOAuthFailoverTarget(
+          route.providerName, transportState.genericFailoverAccountId, Date.now(), route.modelId,
+        )) noteAttemptRecoveryWithheld(logCtx.activeAttempt, "rotation-send-budget");
         if (!nextAccountId) hop.permit?.release();
         if (nextAccountId) {
           try { void response.body?.cancel().catch(() => {}); } catch { /* already closed */ }
@@ -456,7 +459,7 @@ export function createAdapterContinuations(
             if (applied) {
               invalidateSameTargetRequest();
               transportState.activeAdapter = resolveSelectionAdapter(
-                resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire),
+                resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire, route.staticPolicy),
                 config.cacheRetention,
               );
               bindRouteReasoningReplayScope({

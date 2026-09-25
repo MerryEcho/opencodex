@@ -337,7 +337,15 @@ function isProactivePreferenceEnabled(config: OcxConfig, providerName: string, n
 /** Accounts that may serve traffic right now: not cooled, not flagged for reauth, and healthy. */
 export function eligibleFailoverAccounts(providerName: string, now = Date.now(), family?: QuotaModelFamily): string[] {
   ensureHealthCache();
-  const set = getAccountSet(providerName);
+  return eligibleIdsIn(getAccountSet(providerName), providerName, now, family);
+}
+
+function eligibleIdsIn(
+  set: ReturnType<typeof getAccountSet>,
+  providerName: string,
+  now: number,
+  family?: QuotaModelFamily,
+): string[] {
   if (!set) return [];
   const valid = set.accounts
     .filter(account => account.needsReauth !== true
@@ -353,6 +361,26 @@ export function eligibleFailoverAccounts(providerName: string, now = Date.now(),
     .map(account => account.id);
   flushHealthCacheIfDirty();
   return fallback;
+}
+
+/**
+ * Whether reactive rotation has an alternate account it could select right now.
+ *
+ * Answers from the same live roster read and the same guards `rotateGenericOAuthAccountOn429`
+ * applies: a roster of fewer than two accounts has nowhere to go, even when a cached quorum
+ * count or a stale failed id would suggest otherwise. It applies no cooldown and advances no
+ * rotation state; like every eligibility read, it may prune an already-expired cooldown entry.
+ */
+export function hasEligibleGenericOAuthFailoverTarget(
+  providerName: string,
+  failedAccountId: string,
+  now = Date.now(),
+  requestedModelId?: string | null,
+): boolean {
+  const set = getAccountSet(providerName);
+  if (!set || set.accounts.length < 2) return false;
+  const family = classifyModelFamilyForQuota(providerName, requestedModelId);
+  return eligibleIdsIn(set, providerName, now, family).some(id => id !== failedAccountId);
 }
 
 /** Generic pool strategies the kernel can actually run. `quota` IS the pre-kernel path. */
@@ -403,6 +431,7 @@ function stableGenericRoster(providerName: string): string[] {
  * quota-less provider off its active account on the very first request.
  */
 function isOverAutoSwitchThreshold(providerName: string, accountId: string, threshold: number, requestedModelId?: string | null): boolean {
+  if (threshold <= 0) return false;
   const headroom = accountHeadroomPercent(providerName, accountId, requestedModelId);
   if (headroom === null) return false;
   return 100 - headroom >= threshold;
